@@ -430,6 +430,14 @@ class SessionState(BaseModel):
     # Slots the last assistant turn asked for. A bare reply ("Usama khan") is
     # resolved against these, since it carries no phrasing to pattern-match on.
     awaiting: list[SlotName] = Field(default_factory=list)
+    # A country named with no indication of which slot it belongs to. It is held
+    # here, unassigned, until the student says whether it is their citizenship
+    # or their destination - answering "yes" to that either/or settles nothing.
+    pending_country: str | None = None
+    # A destination that matches the student's own citizenship. Studying at
+    # home is not what this service is for, so it is confirmed rather than
+    # recorded - it is usually a mis-typed answer.
+    pending_same_country: str | None = None
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
 

@@ -351,8 +351,15 @@ def _normalise_patch(patch: SlotPatch) -> SlotPatch:
     name like "McDonald" survives untouched.
     """
     if patch.full_name:
-        name = patch.full_name.strip()
-        patch.full_name = _title(name) if name.islower() or name.isupper() else name
+        # Models repeat the student's wording, filler and all, so the same
+        # trimming applies to their output as to our own patterns.
+        patch.full_name = strip_name_filler(patch.full_name.strip())
+
+    # A field of study is a subject - graphic design, IT, economics. The model
+    # sometimes files a destination there ("in uk"), so anything that resolves
+    # to a country is dropped rather than shown as the student's major.
+    if patch.field_of_study and _lookup_country(patch.field_of_study):
+        patch.field_of_study = None
 
     if isinstance(patch.education_level, str):
         # Models sometimes answer with a label rather than the enum value.
@@ -467,14 +474,28 @@ _PHRASE_TAIL_RE: Final = re.compile(
     r"currently|living|based|born|here|looking)\b.*$",
     re.IGNORECASE,
 )
-_NAME_STOPWORDS: Final = frozenset(
+# Politeness and greeting tokens that sit *beside* a name and are trimmed off
+# it: "ahmad here" is Ahmad, "sir ahmad khan" is Ahmad Khan.
+_NAME_TRIM: Final = frozenset(
     {
-        "a", "an", "the", "from", "studying", "study", "currently", "planning",
-        "looking", "interested", "going", "here", "just", "not", "yes", "no",
-        "ok", "okay", "sure", "thanks", "thank", "hello", "hi", "hey", "good",
-        "fine", "student", "applying", "trying", "sorry", "please", "my", "name",
+        "here", "hi", "hii", "hiii", "hello", "helo", "hlo", "hey", "heyy",
+        "yo", "thanks", "thank", "sir", "madam", "dear", "greetings",
+        "morning", "evening", "good", "please", "sorry",
     }
 )
+# Words that mean the capture is not a name at all. These reject the whole
+# phrase rather than being trimmed: "I am from Pakistan" must not yield the
+# name "Pakistan", and "I am not sure yet" must not yield "Yet".
+_NAME_REJECT: Final = frozenset(
+    {
+        "a", "an", "the", "from", "studying", "study", "studied", "currently",
+        "planning", "looking", "interested", "going", "just", "not", "yes",
+        "no", "ok", "okay", "sure", "fine", "student", "applying", "trying",
+        "my", "name", "am", "is", "this", "its", "it", "yet", "know", "dont",
+        "maybe", "idk", "what", "why", "how", "who", "cant", "nothing",
+    }
+)
+_NAME_STOPWORDS: Final = _NAME_TRIM | _NAME_REJECT
 
 _COUNTRY_CANON: Final[tuple[str, ...]] = (
     "Pakistan", "India", "Bangladesh", "Nepal", "Sri Lanka", "Afghanistan",
@@ -639,7 +660,11 @@ def looks_like_noise(message: str) -> bool:
 
 def _normalise_country_key(text: str) -> str:
     key = re.sub(r"[^a-z\s]", " ", text.lower())
-    key = re.sub(r"\b(i am|im|from|the|a|an|of)\b", " ", key)
+    # Prepositions included: "in uk", "at canada" and "to germany" all name a
+    # destination, and must not survive as an unrecognised phrase.
+    key = re.sub(
+        r"\b(i am|im|from|the|a|an|of|in|at|to|into|for)\b", " ", key
+    )
     return re.sub(r"\s+", " ", key).strip()
 
 
@@ -659,6 +684,18 @@ def _lookup_country(text: str) -> str | None:
     compact = key.replace(" ", "")
     if compact in _COUNTRY_COMPACT:
         return _COUNTRY_COMPACT[compact]
+
+    # Short forms: "saudi" for Saudi Arabia, "czech" for Czechia. Only accepted
+    # when the prefix picks out exactly one country - "united" and "south" each
+    # match several, and guessing between them would be worse than asking.
+    if len(compact) >= 4:
+        prefixed = {
+            canonical
+            for name, canonical in _COUNTRY_COMPACT.items()
+            if name.startswith(compact)
+        }
+        if len(prefixed) == 1:
+            return prefixed.pop()
 
     # Typos, but only for words long enough that a near match means something.
     # The cutoff is tuned to accept "indiaa"/"germay" while still separating
@@ -689,6 +726,60 @@ def _canonical_country(text: str) -> str | None:
     return None
 
 
+_ROLE_CITIZENSHIP: Final = re.compile(
+    r"\b(citizen(?:ship)?|nationality|national|passport|home country|"
+    r"i am from|i'm from|im from|from there|i live there|i was born|born there|"
+    r"my country|that'?s? my country)\b",
+    re.IGNORECASE,
+)
+_ROLE_TARGET: Final = re.compile(
+    r"\b(study|studies|studying|go there|going there|destination|target|"
+    r"prefer(?:red|ence)?|want to go|like to go|apply|applying|move there|"
+    r"abroad|where i want)\b",
+    re.IGNORECASE,
+)
+
+
+def same_country(first: str | None, second: str | None) -> bool:
+    """True when two country strings denote the same place.
+
+    Compared canonically, so "turkey", "Turkey" and "turkiye" all match.
+    """
+    if not first or not second:
+        return False
+    left = _lookup_country(first) or _title(first.strip())
+    right = _lookup_country(second) or _title(second.strip())
+    return left.casefold() == right.casefold()
+
+
+def is_affirmation(message: str) -> bool:
+    """A plain yes to a yes/no question."""
+    return bool(_AFFIRMATIONS.match(message.strip()))
+
+
+def is_negation(message: str) -> bool:
+    """A plain no to a yes/no question."""
+    return bool(_NEGATIONS.match(message.strip()))
+
+
+def resolve_country_role(message: str) -> str | None:
+    """Which slot the student means: 'nationality', 'target_country', or None.
+
+    None means the reply did not settle it - "yes" to an either/or question is
+    the common case, and it must re-ask rather than pick a side.
+    """
+    is_citizenship = bool(_ROLE_CITIZENSHIP.search(message))
+    is_target = bool(_ROLE_TARGET.search(message))
+    if is_citizenship == is_target:  # neither, or contradictory
+        return None
+    return "nationality" if is_citizenship else "target_country"
+
+
+def states_country_role(message: str) -> bool:
+    """True when the message's own phrasing says which slot a country fills."""
+    return bool(_NATIONALITY_RE.search(message) or _TARGET_RE.search(message))
+
+
 def bare_country(message: str) -> str | None:
     """The country when a message is *only* a country name, else None.
 
@@ -705,6 +796,97 @@ def bare_country(message: str) -> str | None:
     return _lookup_country(text)
 
 
+# Name particles that stay lowercase when a student writes them that way.
+# They are only ever preserved, never forced down, so "Van Der Berg" as typed
+# survives too.
+_NAME_PARTICLES: Final = frozenset(
+    {
+        "van", "von", "der", "den", "de", "del", "della", "di", "da", "dos",
+        "das", "du", "la", "le", "el", "al", "bin", "binti", "bint", "ibn",
+        "ter", "ten",
+    }
+)
+
+
+def _has_intentional_caps(word: str) -> bool:
+    """True when a word's inner capitals look deliberate rather than mistyped.
+
+    Two signals. What precedes each inner capital: in "McDonald", "O'Brien" and
+    "Jean-Pierre" it follows a lowercase letter, an apostrophe or a hyphen,
+    whereas in "HAshim" and "MUHAMMAD" it follows another capital - a slipped
+    shift key or a caps-locked transcript. And how many there are: real names
+    carry at most one, so the alternating caps of "hAsHiM" are a typo too.
+    """
+    inner_capitals = 0
+    for index, char in enumerate(word):
+        if index == 0 or not char.isupper():
+            continue
+        inner_capitals += 1
+        previous = word[index - 1]
+        if not (previous.islower() or previous in "'-."):
+            return False
+    return inner_capitals <= 1
+
+
+def title_name(value: str) -> str:
+    """Normalise a person's name, keeping genuine capitalisation intact.
+
+    "hashim", "HAshim" and "hAsHiM" all become "Hashim"; "McDonald", "O'Brien"
+    and "van der Berg" are left exactly as the student wrote them.
+    """
+    words: list[str] = []
+    for index, word in enumerate(value.split()):
+        if not word:
+            continue
+        if index > 0 and word.islower() and word in _NAME_PARTICLES:
+            words.append(word)
+        elif _has_intentional_caps(word):
+            words.append(word[0].upper() + word[1:])
+        else:
+            words.append(word[0].upper() + word[1:].lower())
+    return " ".join(words)
+
+
+def _normalise_token(token: str) -> str:
+    return token.lower().strip(".,'\"!?")
+
+
+def _is_trimmable(token: str) -> bool:
+    """True for a greeting that sits beside a name rather than being one."""
+    lowered = _normalise_token(token)
+    if lowered in _NAME_TRIM:
+        return True
+    # Tolerate typos: students write "ahmad here" and mistype it "ahmad heere".
+    # Only words of four or more letters are fuzzy-matched, because a near miss
+    # on "hi" or "yo" would start eating real names.
+    if len(lowered) < 4:
+        return False
+    return bool(
+        difflib.get_close_matches(
+            lowered,
+            [word for word in _NAME_TRIM if len(word) >= 4],
+            n=1,
+            cutoff=0.86,
+        )
+    )
+
+
+def strip_name_filler(value: str) -> str | None:
+    """Trim greetings off a captured name, or None if it is not a name.
+
+    Two different failures are being prevented here, which is why trimming and
+    rejecting are separate: "ahmad here" is a name with a word stuck to it,
+    while "from pakistan" is not a name at all.
+    """
+    tokens = value.split()
+    if any(_normalise_token(t) in _NAME_REJECT for t in tokens):
+        return None
+    words = [t for t in tokens if not _is_trimmable(t)]
+    if not words or len(words) > 4:
+        return None
+    return title_name(" ".join(words))
+
+
 def _extract_name(text: str) -> str | None:
     match = _NAME_RE.search(text)
     if match is None:
@@ -713,13 +895,13 @@ def _extract_name(text: str) -> str | None:
     if not candidate:
         return None
     words = candidate.split()
-    if len(words) > 4 or any(w.lower() in _NAME_STOPWORDS for w in words):
+    if len(words) > 4:
         return None
     if not all(re.fullmatch(r"[A-Za-z][A-Za-z'.-]*", w) for w in words):
         return None
     if not all(_looks_like_word(w) for w in words):
         return None
-    return _title(candidate)
+    return strip_name_filler(candidate)
 
 
 def _extract_level(text: str) -> EducationLevel | None:
@@ -833,13 +1015,15 @@ def interpret_bare_answer(message: str, slot: SlotName) -> Any | None:
         words = text.split()
         if len(words) > 4 or any(ch.isdigit() for ch in text):
             return None
-        if any(w.lower() in _NAME_STOPWORDS for w in words):
+        # A country is an answer to a different question. Without this, a bare
+        # "saudi" offered while the name is still outstanding becomes the name.
+        if _lookup_country(text):
             return None
         if not all(re.fullmatch(r"[A-Za-z][A-Za-z'.-]*", w) for w in words):
             return None
         if not all(_looks_like_word(w) for w in words):
             return None
-        return _title(text)
+        return strip_name_filler(text)
 
     if slot in (SlotName.NATIONALITY, SlotName.TARGET_COUNTRY):
         return _canonical_country(text)

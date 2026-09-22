@@ -32,7 +32,13 @@ from .llm_service import (
     TurnStatus,
     bare_country,
     extract_slots,
+    is_affirmation,
+    is_negation,
     looks_like_noise,
+    resolve_country_role,
+    title_name,
+    same_country,
+    states_country_role,
     stream_reply,
 )
 from .ocr_service import TranscriptParseError, parse_transcript
@@ -311,18 +317,68 @@ async def _event_stream(
             # figures they have not yet checked.
             if state.slots.pending_confirmation():
                 patch, deferred = _restrict_to_confirmation(patch, state)
+                # A country mentioned mid-review is remembered but not placed:
+                # the review is the only question on the table, and the "which
+                # slot" question is asked once it clears.
+                if (
+                    state.pending_country is None
+                    and state.slots.nationality is None
+                    and state.slots.target_country is None
+                ):
+                    state.pending_country = bare_country(message)
 
-            # A lone country name is genuinely ambiguous while both country
-            # slots are open: "Germany" could be citizenship or destination.
-            # Guessing produces a confident, wrong profile, so ask instead.
-            if (
-                state.slots.nationality is None
-                and state.slots.target_country is None
-                and (candidate := bare_country(message)) is not None
-            ):
-                ambiguous_country = candidate
+            # A country already awaiting a role owns this turn: until the
+            # student says which slot it belongs to, no country may be filed.
+            elif state.pending_country:
+                if states_country_role(message) and (
+                    patch.nationality or patch.target_country
+                ):
+                    # They restated it with phrasing that settles it, e.g.
+                    # "I'm from Pakistan" - their own wording wins, and it may
+                    # name a different country than the one we were holding.
+                    state.pending_country = None
+                elif (role := resolve_country_role(message)) is not None:
+                    setattr(patch, role, state.pending_country)
+                    state.pending_country = None
+                else:
+                    # "yes" answers an either/or question with nothing at all.
+                    patch.nationality = None
+                    patch.target_country = None
+
+            # A lone country name is ambiguous while both country slots are
+            # open: "Germany" could be citizenship or destination. Guessing
+            # produces a confident, wrong profile, so ask instead.
+            elif (
+                candidate := bare_country(message)
+            ) is not None and _country_is_ambiguous(candidate, state):
+                state.pending_country = candidate
                 patch.nationality = None
                 patch.target_country = None
+
+            # Destination equal to citizenship: check before recording.
+            known_nationality = patch.nationality or state.slots.nationality
+            if state.pending_same_country:
+                if patch.target_country and not same_country(
+                    patch.target_country, state.pending_same_country
+                ):
+                    # They named somewhere else - that answers it.
+                    state.pending_same_country = None
+                elif is_affirmation(message):
+                    patch.target_country = state.pending_same_country
+                    state.pending_same_country = None
+                elif is_negation(message):
+                    state.pending_same_country = None
+                    patch.target_country = None
+                else:
+                    patch.target_country = None
+            elif patch.target_country and same_country(
+                patch.target_country, known_nationality
+            ):
+                state.pending_same_country = patch.target_country
+                patch.target_country = None
+
+            if state.pending_country:
+                ambiguous_country = state.pending_country
                 deferred = [
                     n
                     for n in deferred
@@ -346,6 +402,7 @@ async def _event_stream(
             noise=bool(message) and not slots_changed and looks_like_noise(message),
             deferred=deferred,
             ambiguous_country=ambiguous_country,
+            same_country_as_home=state.pending_same_country,
         )
 
         # 5. Stream the assistant's reply.
@@ -417,7 +474,10 @@ async def _ingest_upload(state: SessionState, upload: Upload) -> AsyncIterator[s
 
     state.transcript = transcript
     patch = SlotPatch(
-        full_name=transcript.student_name,
+        # Transcripts print names in caps as a typesetting convention, not
+        # because the name is capitalised - normalise so an uploaded name and
+        # a typed one look the same in the profile.
+        full_name=title_name(transcript.student_name) if transcript.student_name else None,
         field_of_study=transcript.field_of_study,
         education_level=transcript.education_level,
         cgpa=transcript.to_academic_score(),
@@ -450,6 +510,86 @@ async def _ingest_upload(state: SessionState, upload: Upload) -> AsyncIterator[s
     yield _frame(SSEEventType.TRANSCRIPT_PARSED, transcript.model_dump(mode="json"))
     if changed:
         yield _frame(SSEEventType.SLOT_UPDATE, _slot_snapshot(state))
+
+
+def _country_is_ambiguous(country: str, state: SessionState) -> bool:
+    """True when a lone country name could reasonably belong to more than one slot.
+
+    With both slots open it could be either. With one already filled by a
+    *different* country it could be the open slot or a change of mind about the
+    filled one - and silently overwriting an answer the student already gave is
+    the failure this prevents. Repeating a country already recorded is not
+    ambiguous; that is handled elsewhere.
+    """
+    if same_country(country, state.slots.nationality) or same_country(
+        country, state.slots.target_country
+    ):
+        return False
+
+    # If the previous turn asked for exactly one of the two country slots, a
+    # bare country is simply the answer to that question. Querying it there
+    # would mean asking "citizenship or destination?" immediately after asking
+    # "where would you like to study?".
+    awaited = [
+        slot
+        for slot in state.awaiting
+        if slot in (SlotName.NATIONALITY, SlotName.TARGET_COUNTRY)
+    ]
+    return len(awaited) != 1
+
+
+def _country_question(country: str, state: SessionState) -> str:
+    """Phrase the disambiguation around what is already known."""
+    nationality = state.slots.nationality
+    target = state.slots.target_country
+
+    if nationality and target:
+        return (
+            f"you already have {nationality} as citizenship and {target} as the "
+            f"destination, so ask which of the two they want to change to {country}"
+        )
+    if nationality:
+        return (
+            f"they already gave {nationality} as their citizenship, so ask "
+            f"whether {country} is where they want to study, or whether they "
+            f"are changing their citizenship to {country}"
+        )
+    if target:
+        return (
+            f"they already gave {target} as their destination, so ask whether "
+            f"{country} is their citizenship, or whether they are changing "
+            f"their destination to {country}"
+        )
+    return (
+        f"ask whether {country} is where they hold citizenship or where they "
+        "would like to study"
+    )
+
+
+def _country_question_fallback(country: str, state: SessionState) -> str:
+    """The same question, phrased for the deterministic fallback path."""
+    nationality = state.slots.nationality
+    target = state.slots.target_country
+
+    if nationality and target:
+        return (
+            f"I have {nationality} as your citizenship and {target} as where you "
+            f"want to study. Which of those did you mean to change to {country}?"
+        )
+    if nationality:
+        return (
+            f"You told me you hold {nationality} citizenship. Is {country} where "
+            f"you want to study, or are you changing your citizenship to {country}?"
+        )
+    if target:
+        return (
+            f"You told me you want to study in {target}. Is {country} where you "
+            f"hold citizenship, or are you changing your destination to {country}?"
+        )
+    return (
+        f"Just so I record it correctly — is {country} where you hold "
+        "citizenship, or where you would like to study?"
+    )
 
 
 def _restrict_to_confirmation(
@@ -486,6 +626,7 @@ def _plan_turn(
     noise: bool = False,
     deferred: list[SlotName] | None = None,
     ambiguous_country: str | None = None,
+    same_country_as_home: str | None = None,
 ) -> tuple[str, str, Any]:
     """Build the directive + deterministic fallback, and the card when unlocked.
 
@@ -587,18 +728,34 @@ def _plan_turn(
         state.awaiting = []
         return directive, fallback, None
 
-    if ambiguous_country:
+    if same_country_as_home:
         directive = (
-            f"The student replied with just a country name, {ambiguous_country}. "
-            "Both their nationality and their target country are still unknown, "
-            "so there is no way to tell which they mean. Do not guess, do not "
-            "record it, and do not claim to have noted it. Ask in one short "
-            f"sentence whether {ambiguous_country} is where they hold citizenship "
-            "or where they would like to study."
+            f"The student named {same_country_as_home} as where they want to "
+            "study, but that is also the country they hold citizenship in - so "
+            "it would not be studying abroad at all. That is usually a mistyped "
+            "or repeated answer. Do not record it and do not assume either way. "
+            "Ask in one short sentence whether they really mean studying inside "
+            f"{same_country_as_home}, or whether they meant a different country. "
+            "A yes means they meant it; otherwise they will name somewhere else."
         )
         fallback = (
-            f"Just so I record it correctly — is {ambiguous_country} where you "
-            "hold citizenship, or where you would like to study?"
+            f"You already hold citizenship in {same_country_as_home}, so "
+            f"studying there would not be studying abroad. Did you mean "
+            f"{same_country_as_home} itself, or a different country?"
+        )
+        state.awaiting = []
+        return directive, fallback, None
+
+    if ambiguous_country:
+        directive = (
+            f"The country {ambiguous_country} is unassigned and the student's "
+            "last message did not settle where it belongs. Do not guess, do not "
+            "record it, and do not claim to have noted it. In one short "
+            f"sentence, {_country_question(ambiguous_country, state)}. Invite "
+            "them to answer with the word citizenship or the word study."
+        )
+        fallback = _country_question_fallback(ambiguous_country, state) + (
+            ' Reply with "citizenship" or "study" and I will record it.'
         )
         # The next reply answers this question, not a slot in the usual order.
         state.awaiting = []
