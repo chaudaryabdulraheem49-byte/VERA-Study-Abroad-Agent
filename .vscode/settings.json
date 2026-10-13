@@ -1,0 +1,21 @@
+{
+  // The suite is pytest, and it lives under backend/ with its own pytest.ini
+  // (asyncio_mode=auto for the async tests). unittest discovery with a
+  // "*_test.py" pattern matched none of these files, so the Testing panel
+  // stayed empty.
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+
+  // Run from backend/ so pytest.ini is picked up and `app` imports resolve.
+  "python.testing.cwd": "${workspaceFolder}/backend",
+  "python.testing.pytestArgs": ["tests"],
+
+  // The venv holding fastapi, qdrant-client, sqlalchemy and pytest.
+  "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
+
+  "python.analysis.extraPaths": ["${workspaceFolder}/backend"],
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true
+  }
+}

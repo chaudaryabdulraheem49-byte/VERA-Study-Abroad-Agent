@@ -5,12 +5,16 @@ multipart form data (the same fields plus a `file` transcript) and answers with
 an SSE stream carrying:
 
     status             transient progress ("parsing your transcript")
-    token              assistant text, streamed
+    text_delta         assistant text, streamed
     slot_update        the current state of the onboarding fields
     transcript_parsed  structured OCR output for the upload
     diagnostic_card    the Phase 1 conversion card (JSON payload)
+    university_matches the Phase 2 course matches the card unlocks
     error              a user-safe failure message
     done               terminal frame, carries the session id
+
+`POST /api/chat/upload` parses a transcript on its own and answers with JSON
+rather than a stream, for callers that want the extraction without a turn.
 """
 
 from __future__ import annotations
@@ -21,20 +25,38 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Final
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .auth import AuthenticatedUser, get_current_user
+from . import chat_history
 from .config import get_settings
+from .course_matching import (
+    MatchingUnavailable,
+    MatchResult,
+    build_guidance,
+    build_query,
+    expand_field,
+    find_matches,
+    _LEVEL_NAMES,
+    target_degree_levels,
+)
 from .diagnostics import DiagnosticsUnavailable, build_card
-from .gpa_converter import ConversionError
+from .gpa_converter import ConversionError, convert
 from .llm_service import (
+    _chunk_text,
+    generate_title,
     TurnStatus,
     bare_country,
+    country_aliases,
+    extract_countries,
     extract_slots,
     is_affirmation,
     is_negation,
+    asks_to_share_transcript,
     looks_like_noise,
+    means_every_option,
     resolve_country_role,
     title_name,
     same_country,
@@ -43,9 +65,14 @@ from .llm_service import (
 )
 from .ocr_service import TranscriptParseError, parse_transcript
 from .scope import ScopeVerdict, classify, refusal_directive
+from pydantic import BaseModel, ConfigDict
+
 from .schemas import (
+    AcademicScore,
     ChatRequest,
+    DiagnosticCardPayload,
     EducationLevel,
+    GradingScale,
     SessionState,
     SlotName,
     SlotPatch,
@@ -92,6 +119,48 @@ SCOPE_REMINDER: Final = (
     "weather, sport, news, celebrities or general trivia: say in one short "
     "sentence that it is outside what you cover, then carry on with their "
     "application. When in doubt, treat the question as in scope and answer it."
+)
+
+# Appended whenever the student is asking about universities or programmes.
+#
+# The model was listing named universities with invented entry percentages -
+# "Group of Eight typically require 65%+", "RMIT ... flexible entry" - directly
+# above a grid of real, indexed courses. Two problems at once: the figures are
+# not checked against anything, and they are a second, contradictory shortlist
+# sitting on top of the one the search actually produced. The prose should set
+# the student up for the grid, not compete with it.
+# Leads the instruction rather than trailing it, and is stated as a limit on
+# the reply's *shape* first, because a rule buried under three sentences of
+# content guidance is the one a small model drops.
+#
+# The earlier wording also forbade stating any entry requirement at all, while
+# the same directive handed the model system-computed notes that are entry
+# requirements. Told both to use them and never to mention them, the model
+# resolved the contradiction by ignoring the rule wholesale - and then invented
+# institutions too. The prohibition is now on *unverified* specifics: facts
+# supplied in the instruction are fine, anything from the model's own memory is
+# not.
+# The part that holds on every turn, shortlist or not. During onboarding the
+# model was volunteering "an MSc in Advanced Computer Science" before it had
+# run a single search - invented just as surely as a named university.
+NO_INVENTED_SPECIFICS: Final = (
+    " Never name a university, college, campus or specific named programme - "
+    "not one, not as an example. You have no university database, so any "
+    "institution or course you name is invented. Do not state any figure, "
+    "requirement, fee or ranking that is not given to you verbatim above - do "
+    "not convert, estimate or add to them."
+)
+
+SHORTLIST_DIRECTIVE: Final = (
+    " HOW TO REPLY - this governs the whole answer and overrides anything "
+    "above it. Write at most three short sentences of plain prose. Never write "
+    "a list, numbered or bulleted."
+    + NO_INVENTED_SPECIFICS
+    + " A verified shortlist from a real course index is rendered on screen "
+    "directly beneath your reply; naming your own would contradict it. The "
+    "three sentences are: acknowledge what they asked for, say in general "
+    "terms whether it is a realistic move and how their converted grade sits "
+    "against it, then say the matching programmes are shown below. Stop there."
 )
 
 GREETING: Final = (
@@ -146,8 +215,14 @@ class Upload:
         self.content_type = content_type
 
 
-async def _read_request(request: Request) -> tuple[str | None, str, Upload | None]:
-    """Return (session_id, message, upload) from a JSON or multipart request."""
+async def _read_request(
+    request: Request, *, file_only: bool = False
+) -> tuple[str | None, str, Upload | None]:
+    """Return (session_id, message, upload) from a JSON or multipart request.
+
+    `file_only` is for the upload endpoint, where a message is not expected and
+    a missing file is the thing worth naming in the error.
+    """
     content_type = (request.headers.get("content-type") or "").lower()
 
     if content_type.startswith("multipart/form-data"):
@@ -170,10 +245,14 @@ async def _read_request(request: Request) -> tuple[str | None, str, Upload | Non
                 filename=getattr(candidate, "filename", "transcript") or "transcript",
                 content_type=getattr(candidate, "content_type", None),
             )
-        if not message and upload is None:
+        if upload is None and (file_only or not message):
             raise HTTPException(
                 status_code=422,
-                detail="Send a message, a file, or both.",
+                detail=(
+                    "Attach a transcript as `file`."
+                    if file_only
+                    else "Send a message, a file, or both."
+                ),
             )
         return session_id, message[:MAX_MESSAGE_CHARS], upload
 
@@ -221,20 +300,276 @@ async def reset_session(session_id: str, request: Request) -> None:
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(request: Request) -> StreamingResponse:
+async def chat_stream(
+    request: Request,
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> StreamingResponse:
     session_id, message, upload = await _read_request(request)
     store = get_store(request)
     state = await store.load_or_create(session_id)
 
+    # The session keeps its own id either way; the thread is the *saved*
+    # record, and only exists for a signed-in student with history configured.
+    thread_id = await _ensure_thread(user, state, message)
+
     return StreamingResponse(
-        _event_stream(state, message, upload, store),
+        _event_stream(state, message, upload, store, user=user, thread_id=thread_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # stop nginx from buffering the stream
             "X-Session-Id": state.session_id,
+            **({"X-Thread-Id": thread_id} if thread_id else {}),
         },
+    )
+
+
+class ConvertRequest(BaseModel):
+    """One grade, as a standalone conversion.
+
+    The same `convert()` the chat uses - a second implementation would be a
+    second set of numbers to keep in agreement, and these are numbers a
+    student plans around.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    raw_value: float
+    scale: GradingScale = GradingScale.PERCENTAGE
+    scale_max: float | None = None
+    scale_min_pass: float | None = None
+    # Only picks the minimum passing mark when the transcript does not state
+    # one; Pakistan and India pass at 40%, China at 60%.
+    country: str | None = None
+
+
+@app.post("/api/convert")
+async def convert_grade(payload: ConvertRequest) -> dict[str, Any]:
+    """Grade conversion as a tool, independent of a conversation.
+
+    Deliberately unauthenticated: it stores nothing, reads nothing, and
+    answers from the request alone - an arithmetic endpoint, not a user one.
+    """
+    score = AcademicScore(
+        raw_value=payload.raw_value,
+        scale=payload.scale,
+        scale_max=payload.scale_max,
+        scale_min_pass=payload.scale_min_pass,
+    )
+    try:
+        conversion = convert(score, country=payload.country)
+    except ConversionError as exc:
+        # 422, not 500: an unstated scale is the caller's to fix, and the
+        # message says how.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return conversion.model_dump(mode="json")
+
+
+@app.get("/api/discovery")
+async def discover_courses(
+    country: str | None = None,
+    degree_level: str | None = None,
+    field_broad: str | None = None,
+    query: str | None = None,
+    max_tuition_usd: float | None = None,
+    free_only: bool = False,
+    post_study_work: bool = False,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Browse the indexed catalogue by filter rather than by conversation.
+
+    Reads Postgres only - no embedding call, so this works whether or not a
+    course has a vector yet and costs nothing against the daily allowance.
+    """
+    import re
+
+    from sqlalchemy import or_, select
+
+    from .course_matching import _FIELD_EXPANSIONS, expand_field
+    from .services.phase2.db import Course, session_scope
+
+    query_stmt = select(Course)
+    if country:
+        query_stmt = query_stmt.where(Course.country.in_(country_aliases(country)))
+    if degree_level:
+        query_stmt = query_stmt.where(Course.degree_level == degree_level)
+
+    search_raw = (field_broad or query or "").strip()
+    if search_raw:
+        expanded = expand_field(search_raw)
+        is_known_abbrev = search_raw.lower() in _FIELD_EXPANSIONS
+
+        search_conditions = []
+        main_terms = set()
+        if expanded and expanded.lower() != search_raw.lower():
+            main_terms.add(expanded)
+        if not is_known_abbrev:
+            main_terms.add(search_raw)
+
+        for term in main_terms:
+            pattern = f"%{term}%"
+            search_conditions.extend([
+                Course.course_title.ilike(pattern),
+                Course.field_broad.ilike(pattern),
+                Course.field_narrow.ilike(pattern),
+                Course.field_detailed.ilike(pattern),
+                Course.syllabus_description.ilike(pattern),
+            ])
+
+        # For short acronyms (e.g. IT, AI, CS, MBA), match as a whole word boundary
+        # in the course_title only (e.g. "Master of IT"), NEVER as a loose substring
+        # '%it%' which would match 'university', 'credit', etc.
+        if len(search_raw) <= 4 and re.match(r"^[A-Za-z0-9]+$", search_raw):
+            safe_token = re.escape(search_raw)
+            search_conditions.append(
+                Course.course_title.op("~*")(rf"\y{safe_token}\y")
+            )
+
+        query_stmt = query_stmt.where(or_(*search_conditions))
+
+    if free_only:
+        query_stmt = query_stmt.where(Course.tuition_fee_usd <= 0)
+    elif max_tuition_usd is not None:
+        query_stmt = query_stmt.where(Course.tuition_fee_usd <= max_tuition_usd)
+    if post_study_work:
+        query_stmt = query_stmt.where(Course.post_study_work_eligible.is_(True))
+
+    query_stmt = query_stmt.order_by(Course.tuition_fee_usd.asc()).limit(min(limit, 200))
+
+    try:
+        async with session_scope() as session:
+            rows = (await session.execute(query_stmt)).scalars().all()
+    except Exception as exc:  # noqa: BLE001 - the database may simply be down
+        logger.warning("Discovery query failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="The course index is unavailable."
+        ) from exc
+
+    return {
+        "count": len(rows),
+        "courses": [
+            {
+                "course_id": str(row.course_id),
+                "course_title": row.course_title,
+                "university_name": row.university_name,
+                "country": row.country,
+                "degree_level": row.degree_level,
+                "field_broad": row.field_broad,
+                "tuition_fee_usd": row.tuition_fee_usd,
+                "tuition_fee_amount": row.tuition_fee_amount,
+                "currency": row.currency,
+                "min_gpa_percent": row.min_gpa_percent,
+                "min_ielts_score": row.min_ielts_score,
+                "duration_weeks": row.duration_weeks,
+                "post_study_work_eligible": row.post_study_work_eligible,
+                "deadline_type": row.deadline_type,
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/api/history/threads")
+async def list_threads(
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """The signed-in student's saved conversations, newest first."""
+    if user.is_anonymous or not get_settings().history_configured:
+        # An empty list rather than a 404: "you have no saved conversations"
+        # and "this deployment does not save them" look the same to a sidebar,
+        # and `enabled` tells the client which it is.
+        return {"threads": [], "enabled": False}
+    return {
+        "threads": await chat_history.list_threads(user.id),
+        "enabled": True,
+    }
+
+
+@app.get("/api/history/threads/{thread_id}")
+async def read_thread(
+    thread_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """One saved conversation. Empty unless it belongs to this user."""
+    if user.is_anonymous or not get_settings().history_configured:
+        raise HTTPException(status_code=404, detail="Chat history is not available.")
+
+    messages = await chat_history.list_messages(user.id, thread_id)
+    if not messages and not await chat_history.owns_thread(user.id, thread_id):
+        # Deliberately the same answer as a thread that does not exist: saying
+        # "that is not yours" confirms it exists and belongs to someone.
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return {"thread_id": thread_id, "messages": messages}
+
+
+@app.delete("/api/history/threads/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_thread(
+    thread_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> None:
+    if user.is_anonymous or not get_settings().history_configured:
+        raise HTTPException(status_code=404, detail="Chat history is not available.")
+    if not await chat_history.owns_thread(user.id, thread_id):
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    await chat_history.delete_thread(user.id, thread_id)
+
+
+@app.post("/api/chat/upload")
+async def chat_upload(
+    request: Request,
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> JSONResponse:
+    """Parse a transcript on its own and return the extracted fields as JSON.
+
+    The streaming endpoint also accepts a file, and that remains the path the
+    chat UI uses because it answers in the same turn. This endpoint exists for
+    callers that want the structured extraction without a conversation: it
+    folds the values into the session exactly the same way, so a later chat
+    turn picks up where this left off.
+    """
+    session_id, _, upload = await _read_request(request, file_only=True)
+    assert upload is not None  # _read_request refuses the request without one
+
+    store = get_store(request)
+    state = await store.load_or_create(session_id)
+
+    try:
+        transcript = await parse_transcript(
+            upload.content, upload.filename, upload.content_type
+        )
+    except TranscriptParseError as exc:
+        # A bad scan is the student's problem to fix, not a server fault, and
+        # the session is left untouched so they can simply try again.
+        return JSONResponse(
+            status_code=422,
+            content={"detail": str(exc), "session_id": state.session_id},
+        )
+
+    state.transcript = transcript
+    state.transcript_parsed = True
+    state.slots.merge(
+        SlotPatch(
+            full_name=title_name(transcript.student_name)
+            if transcript.student_name
+            else None,
+            field_of_study=transcript.field_of_study,
+            education_level=transcript.education_level,
+            cgpa=transcript.to_academic_score(),
+        ),
+        from_ocr=True,
+    )
+    state.append("system", f"Transcript uploaded and parsed ({upload.filename}).")
+    await store.save(state)
+
+    return JSONResponse(
+        content={
+            "session_id": state.session_id,
+            "transcript_parsed": True,
+            "extracted": transcript.model_dump(mode="json"),
+            "slots": _slot_snapshot(state),
+        },
+        headers={"X-Session-Id": state.session_id},
     )
 
 
@@ -255,9 +590,15 @@ async def _event_stream(
     message: str,
     upload: Upload | None,
     store: SessionStore,
+    *,
+    user: AuthenticatedUser | None = None,
+    thread_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Drive one turn: ingest, fill slots, stream a reply, maybe emit a card."""
     turn = TurnStatus()
+    # Collected as the reply streams and written once at the end: a hundred
+    # token-sized inserts per turn would cost more than the conversation.
+    reply_chunks: list[str] = []
     try:
         # A brand-new session has only the client-side greeting behind it, and
         # that greeting invites the student to introduce themselves - so treat a
@@ -293,8 +634,10 @@ async def _event_stream(
                 state, directive, fallback=fallback, status=turn
             ):
                 reply_parts.append(token)
+                reply_chunks.append(token)
                 yield _frame(SSEEventType.TOKEN, {"text": token})
             state.append("assistant", "".join(reply_parts))
+            await _save_turn(user, thread_id, message, "".join(reply_chunks))
             yield _frame(
                 SSEEventType.DONE,
                 {
@@ -306,9 +649,19 @@ async def _event_stream(
 
         # 3. Free-text extraction (multi-field capable).
         slots_changed = transcript_ingested
+        # Set when the student changes what they are asking for rather than
+        # what we know about them: the report stays put, the shortlist moves.
+        rematch = False
         deferred: list[SlotName] = []
         ambiguous_country: str | None = None
         if message:
+            # Named so the client can show which step is running rather than a
+            # single undifferentiated spinner. This is real work - a model call
+            # - not a decorative delay.
+            yield _frame(
+                SSEEventType.STATUS,
+                {"stage": "understanding", "message": "Reading what you said..."},
+            )
             patch = await extract_slots(message, state, status=turn)
 
             # While transcript values are awaiting review, the review is the
@@ -345,12 +698,72 @@ async def _event_stream(
                     patch.nationality = None
                     patch.target_country = None
 
+            # A grade that replaces one already on the profile. Held until the
+            # student confirms, because every figure downstream - the
+            # conversion, the eligibility filter, the shortlist - moves with
+            # it, and a silent swap gives them no way to notice.
+            if state.pending_grade is not None:
+                if is_affirmation(message):
+                    patch.cgpa = state.pending_grade
+                    state.pending_grade = None
+                elif is_negation(message):
+                    state.pending_grade = None
+                    patch.cgpa = None
+                elif patch.cgpa is not None:
+                    # Naming a grade instead of answering yes or no settles it
+                    # just as well - that is the number they want.
+                    state.pending_grade = None
+                else:
+                    patch.cgpa = None
+            elif (
+                patch.cgpa is not None
+                and state.slots.cgpa is not None
+                and patch.cgpa != state.slots.cgpa
+                # An OCR value the student has not yet checked is not an answer
+                # they gave, so replacing it needs no permission from them.
+                and SlotName.CGPA in state.slots.user_confirmed
+            ):
+                state.pending_grade = patch.cgpa
+                patch.cgpa = None
+
+            # Several destinations in one message. Recording the first and
+            # discarding the rest is the silent kind of wrong - the dropped
+            # one is never mentioned again - so they are held until the
+            # student says whether they meant all of them.
+            if state.pending_multi_country:
+                # "Both" is the commonest answer here and is not a plain yes,
+                # so it used to settle nothing - and the destinations the
+                # student had just agreed to were dropped in silence.
+                if is_affirmation(message) or means_every_option(message):
+                    chosen = state.pending_multi_country
+                    patch.target_country = chosen[0]
+                    patch.extra_countries = chosen[1:]
+                    state.pending_multi_country = []
+                elif is_negation(message):
+                    state.pending_multi_country = []
+                    patch.target_country = None
+                elif named := extract_countries(message):
+                    # Naming a country instead of answering yes or no settles
+                    # it just as well.
+                    patch.target_country = named[0]
+                    patch.extra_countries = named[1:]
+                    state.pending_multi_country = []
+            elif (
+                not state.slots.target_country
+                and len(destinations := _destinations_named(message, state, patch)) > 1
+            ):
+                state.pending_multi_country = destinations
+                patch.target_country = None
+                patch.extra_countries = []
+
             # A lone country name is ambiguous while both country slots are
             # open: "Germany" could be citizenship or destination. Guessing
             # produces a confident, wrong profile, so ask instead.
-            elif (
-                candidate := bare_country(message)
-            ) is not None and _country_is_ambiguous(candidate, state):
+            if (
+                not state.pending_multi_country
+                and (candidate := bare_country(message)) is not None
+                and _country_is_ambiguous(candidate, state)
+            ):
                 state.pending_country = candidate
                 patch.nationality = None
                 patch.target_country = None
@@ -387,9 +800,22 @@ async def _event_stream(
 
             if patch.confirms_ocr:
                 state.slots.confirm_all_ocr()
+            # A stated preference is not a slot - it does not gate the
+            # barrier - but it does steer the search, and it persists so a
+            # later turn still knows what they asked for.
+            if (
+                patch.desired_level is not None
+                and patch.desired_level != state.desired_level
+            ):
+                state.desired_level = patch.desired_level
+                rematch = True
             changed = state.slots.merge(patch)
             if changed or patch.confirms_ocr:
                 slots_changed = True
+                # A changed destination or subject should also refresh the
+                # shortlist, even when the report itself reads the same.
+                if state.diagnostics_unlocked:
+                    rematch = True
                 yield _frame(SSEEventType.SLOT_UPDATE, _slot_snapshot(state))
 
         # 4. Decide what this turn should say.
@@ -402,23 +828,110 @@ async def _event_stream(
             noise=bool(message) and not slots_changed and looks_like_noise(message),
             deferred=deferred,
             ambiguous_country=ambiguous_country,
+            multi_country=state.pending_multi_country or None,
             same_country_as_home=state.pending_same_country,
+            grade_change=state.pending_grade,
+            # Said they want their transcript read but sent nothing yet. Only
+            # when no file arrived - once one has, it is parsed, not awaited.
+            awaiting_transcript=(
+                bool(message)
+                and not transcript_ingested
+                and asks_to_share_transcript(message)
+            ),
         )
 
-        # 5. Stream the assistant's reply.
-        reply_parts = []
-        async for token in stream_reply(
-            state, directive + SCOPE_REMINDER, fallback=fallback, status=turn
-        ):
-            reply_parts.append(token)
-            yield _frame(SSEEventType.TOKEN, {"text": token})
+        if card is not None:
+            yield _frame(
+                SSEEventType.STATUS,
+                {"stage": "diagnosing", "message": "Working out where you stand..."},
+            )
+
+        # 5. Say where they stand.
+        #
+        # On the turn that produces the report, the text is written here rather
+        # than by the model. Four separate instructions told it not to list
+        # universities - leading the prompt, naming the failure, forbidding
+        # examples - and it listed Waterloo, UBC and Concordia with invented
+        # entry requirements anyway, directly above the real indexed shortlist.
+        #
+        # There is nothing left to tighten: a lite model will not reliably obey
+        # a prohibition, and the cost of it disobeying is a student acting on
+        # admissions figures nobody checked. The deterministic sentences below
+        # quote the computed conversion and nothing else, and the card and the
+        # verified grid follow immediately - which is where the real content
+        # was always meant to live.
+        reply_parts: list[str] = []
+        if card is not None:
+            # Chunked rather than sent whole: the text is deterministic, but
+            # the student should still see it arrive. One frame would make the
+            # report turn - the one that matters most - the only turn in the
+            # conversation that lands as a block.
+            for chunk in _chunk_text(fallback):
+                reply_parts.append(chunk)
+                reply_chunks.append(chunk)
+                yield _frame(SSEEventType.TOKEN, {"text": chunk})
+                # Yield to the event loop so each frame is flushed on its own
+                # rather than the whole set landing in one write.
+                await asyncio.sleep(0)
+        else:
+            async for token in stream_reply(
+                state, directive + SCOPE_REMINDER, fallback=fallback, status=turn
+            ):
+                reply_parts.append(token)
+                reply_chunks.append(token)
+                yield _frame(SSEEventType.TOKEN, {"text": token})
         state.append("assistant", "".join(reply_parts))
 
-        # 6. Emit the diagnostic card once the barrier is cleared.
+        # 6. Emit the diagnostic card once the barrier is cleared, then the
+        #    course matches it unlocks. The card goes out first so the student
+        #    sees their standing while the search runs.
         if card is not None:
             state.diagnostics_unlocked = True
             state.last_card = card
-            yield _frame(SSEEventType.DIAGNOSTIC_CARD, card.model_dump(mode="json"))
+            payload = card.model_dump(mode="json")
+            yield _frame(SSEEventType.DIAGNOSTIC_CARD, payload)
+
+            # The profile is complete here, so the sidebar label can finally
+            # say what the conversation is about rather than quoting whatever
+            # the student happened to type first. Backgrounded: a rename must
+            # not hold up the card or the shortlist behind it.
+            retitle = asyncio.create_task(
+                _retitle_from_profile(user, thread_id, state)
+            )
+            _background_tasks.add(retitle)
+            retitle.add_done_callback(_background_tasks.discard)
+            # Saved exactly as sent, so reopening the conversation replays the
+            # report rather than rebuilding it from the transcript.
+            await _save_artifact(
+                user,
+                thread_id,
+                kind="diagnostic_card",
+                summary="Diagnostic report",
+                payload=payload,
+            )
+
+            yield _frame(
+                SSEEventType.STATUS,
+                {"stage": "matching", "message": "Finding programmes that fit..."},
+            )
+            async for frame in _emit_matches(
+                state, card, user=user, thread_id=thread_id
+            ):
+                yield frame
+
+        elif rematch and state.last_card is not None:
+            # The report is unchanged and must not be re-sent, but what the
+            # student is asking for has changed - a different level, a
+            # different destination, a different subject. Matching runs again
+            # on its own so the grid answers the question actually asked.
+            yield _frame(
+                SSEEventType.STATUS,
+                {"stage": "matching", "message": "Finding programmes that fit..."},
+            )
+            async for frame in _emit_matches(
+                state, state.last_card, user=user, thread_id=thread_id
+            ):
+                yield frame
 
         if turn.rate_limited:
             yield _frame(
@@ -433,6 +946,13 @@ async def _event_stream(
                     "recoverable": True,
                 },
             )
+
+        await _save_turn(user, thread_id, message, "".join(reply_chunks))
+        retitle_task = asyncio.create_task(
+            _maybe_retitle_thread(user, thread_id, state, message)
+        )
+        _background_tasks.add(retitle_task)
+        retitle_task.add_done_callback(_background_tasks.discard)
 
         yield _frame(
             SSEEventType.DONE,
@@ -473,6 +993,7 @@ async def _ingest_upload(state: SessionState, upload: Upload) -> AsyncIterator[s
         return
 
     state.transcript = transcript
+    state.transcript_parsed = True
     patch = SlotPatch(
         # Transcripts print names in caps as a typesetting convention, not
         # because the name is capitalised - normalise so an uploaded name and
@@ -512,6 +1033,73 @@ async def _ingest_upload(state: SessionState, upload: Upload) -> AsyncIterator[s
         yield _frame(SSEEventType.SLOT_UPDATE, _slot_snapshot(state))
 
 
+def _destinations_named(
+    message: str, state: SessionState, patch: SlotPatch | None = None
+) -> list[str]:
+    """Countries that are plainly destinations this turn.
+
+    Two sources, because the student and the model phrase it differently.
+
+    The model is checked first and trusted outright: when it files
+    `target_country` as "Australia and UK" it has already decided both are
+    destinations, and no turn-context test is needed. That string is also what
+    made this necessary - stored verbatim it becomes a country nothing in the
+    index is in, so the filter quietly matches nothing.
+
+    Falling back to the raw message needs more care. "I am from India and want
+    to study in Australia" names two countries and one destination, so a bare
+    count is not enough: it only reports more than one when the turn is about
+    where they want to go, and citizenship is removed first.
+
+    The two sources are also merged rather than tried in turn, because they
+    fail on different inputs. The literal matcher cannot read "Austraalia UK"
+    as two countries - it only sees the UK - while the model reads the typo
+    and files Australia. Taking whichever source fires first would then record
+    one destination silently when the student plainly named two.
+    """
+    # Citizenship is not a destination, and it may be arriving in this very
+    # patch rather than already being on the profile.
+    home = (patch.nationality if patch is not None else None) or state.slots.nationality
+
+    from_model: list[str] = []
+    if patch is not None and patch.target_country:
+        from_model = extract_countries(patch.target_country)
+
+    named = extract_countries(message)
+
+    if from_model:
+        # The model filing a destination settles what this turn is about, so
+        # the turn-context test below is not needed: anything else it names is
+        # a second destination, not a possible citizenship.
+        return _dedupe_countries([*from_model, *named], home)
+
+    if len(named) < 2:
+        return []
+
+    asked_for_destination = SlotName.TARGET_COUNTRY in state.awaiting
+    if not asked_for_destination and not state.slots.nationality:
+        # Citizenship is still open, so one of these may well be it.
+        return []
+
+    return _dedupe_countries(named, home)
+
+
+def _dedupe_countries(countries: list[str], home: str | None) -> list[str]:
+    """Distinct destinations, in the order named, minus the student's own country.
+
+    Compared with `same_country` rather than by string, so "UK" and "United
+    Kingdom" are not reported as two places to apply to.
+    """
+    out: list[str] = []
+    for country in countries:
+        if home and same_country(country, home):
+            continue
+        if any(same_country(country, seen) for seen in out):
+            continue
+        out.append(country)
+    return out if len(out) > 1 else []
+
+
 def _country_is_ambiguous(country: str, state: SessionState) -> bool:
     """True when a lone country name could reasonably belong to more than one slot.
 
@@ -536,6 +1124,41 @@ def _country_is_ambiguous(country: str, state: SessionState) -> bool:
         if slot in (SlotName.NATIONALITY, SlotName.TARGET_COUNTRY)
     ]
     return len(awaited) != 1
+
+
+def _describe_score(score: AcademicScore | None) -> str:
+    """A grade as a student would say it: "3.2 out of 4.0", "82%"."""
+    if score is None:
+        return "your previous grade"
+
+    def trim(value: float) -> str:
+        # 3.0 reads as "3", 3.2 as "3.2" - trailing zeros look like precision
+        # the student did not give.
+        return f"{value:g}"
+
+    if score.scale is GradingScale.PERCENTAGE:
+        return f"{trim(score.raw_value)}%"
+    if score.scale_max:
+        return f"{trim(score.raw_value)} out of {trim(score.scale_max)}"
+    return trim(score.raw_value)
+
+
+def _list_countries(countries: list[str]) -> str:
+    """"Australia and the UK", "Australia, the UK and Canada"."""
+    named = [_with_article(c) for c in countries]
+    if not named:
+        # Previously an IndexError. Every existing caller happens to check
+        # first, so an empty list never reached it - which made it a trap for
+        # the next one rather than a safe helper.
+        return ""
+    if len(named) == 1:
+        return named[0]
+    return ", ".join(named[:-1]) + " and " + named[-1]
+
+
+def _with_article(country: str) -> str:
+    """Countries whose names take "the" read wrong without it."""
+    return f"the {country}" if country in {"UK", "USA", "UAE", "Netherlands"} else country
 
 
 def _country_question(country: str, state: SessionState) -> str:
@@ -592,6 +1215,395 @@ def _country_question_fallback(country: str, state: SessionState) -> str:
     )
 
 
+async def _ensure_thread(
+    user: AuthenticatedUser, state: SessionState, message: str
+) -> str | None:
+    """The saved thread for this session, creating one on the first message.
+
+    Returns None whenever history is not available - not signed in, Supabase
+    not configured, or the write failed. The conversation then behaves exactly
+    as it did before accounts existed, which is the point: persistence is an
+    addition, never a precondition.
+    """
+    if user.is_anonymous or not get_settings().history_configured:
+        return None
+    if state.thread_id:
+        return state.thread_id
+
+    # Created with a label taken from the first message (or 'New conversation' if a greeting).
+    # If the first message has real intent and substance, we kick off generation immediately.
+    # If it is a greeting ('hey', 'hello'), title generation is deferred until future turns
+    # provide sufficient context.
+    initial_title = chat_history.derive_title(message)
+    thread = await chat_history.create_thread(user.id, title=initial_title)
+    if thread is None:
+        return None
+    state.thread_id = str(thread["id"])
+    state.saved_title = initial_title
+
+    if not chat_history.is_greeting_or_generic(message):
+        task = asyncio.create_task(
+            _retitle_thread(user.id, state.thread_id, message, state=state)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    return state.thread_id
+
+
+# asyncio keeps only a weak reference to a running task, so one that nothing
+# holds can be collected before it finishes.
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _title_case_subject(field: str) -> str:
+    """"graphic design" -> "Graphic Design", without flattening acronyms.
+
+    `str.title()` turns "IT" into "It" and "MBA" into "Mba", which looks like
+    a typo in a sidebar.
+    """
+    words = []
+    for word in field.split():
+        if word.isupper() and len(word) <= 4:
+            words.append(word)  # IT, MBA, AI, HR
+        else:
+            words.append(word[:1].upper() + word[1:])
+    return " ".join(words)
+
+
+def profile_title(state: SessionState) -> str | None:
+    """A label built from what the student actually told us.
+
+    Assembled rather than generated: uses structured values the student gave,
+    such as degree level applied for, field of study, and target country
+    (e.g., 'Masters in CS - Australia' or 'Masters in Computer Science').
+    Returns None when there is not enough context to beat the existing label.
+    """
+    slots = state.slots
+
+    # The level they are applying FOR, not the one they hold.
+    if state.desired_level is not None:
+        level = _LEVEL_NAMES.get(state.desired_level)
+    else:
+        wanted = target_degree_levels(slots.education_level)
+        level = wanted[0] if wanted else None
+
+    field = _title_case_subject(slots.field_of_study) if slots.field_of_study else None
+    where = _list_countries(slots.destinations())
+
+    # A title that says only "Masters" or only "Australia" tells a student
+    # nothing when every conversation says the same - so at least two parts.
+    parts = [p for p in (level, field) if p]
+    if not parts or (len(parts) == 1 and not where):
+        return None
+
+    title = " ".join(parts)
+    if where:
+        title = f"{title} - {where}"
+    return title[:chat_history.TITLE_CHARS]
+
+
+async def _retitle_from_profile(
+    user: AuthenticatedUser | None, thread_id: str | None, state: SessionState
+) -> None:
+    """Upgrade the label once the profile is complete. Never raises."""
+    if user is None or thread_id is None:
+        return
+    title = profile_title(state)
+    if not title or title == state.saved_title:
+        return
+    if await chat_history.update_thread_title(user.id, thread_id, title):
+        # Remembered so a later turn does not rewrite the same value.
+        state.saved_title = title
+
+
+def extract_title_context(
+    state: SessionState, current_message: str | None = None
+) -> str:
+    """Build a rich conversation context to help the LLM generate a focused title."""
+    parts: list[str] = []
+
+    profile_clues: list[str] = []
+    if state.desired_level is not None:
+        lvl = _LEVEL_NAMES.get(state.desired_level)
+        if lvl:
+            profile_clues.append(f"Level: {lvl}")
+    if state.slots.field_of_study:
+        profile_clues.append(f"Field: {state.slots.field_of_study}")
+    dests = state.slots.destinations()
+    if dests:
+        profile_clues.append(f"Country: {', '.join(dests)}")
+    if state.slots.cgpa:
+        profile_clues.append(f"GPA: {state.slots.cgpa.raw_value}")
+    if profile_clues:
+        parts.append(f"Profile: {'; '.join(profile_clues)}")
+
+    user_msgs: list[str] = []
+    for m in state.messages:
+        if m.role == "user" and m.content.strip():
+            user_msgs.append(m.content.strip())
+    if current_message and current_message.strip():
+        if not user_msgs or user_msgs[-1] != current_message.strip():
+            user_msgs.append(current_message.strip())
+
+    substantive = [m for m in user_msgs if not chat_history.is_greeting_or_generic(m)]
+    messages_to_use = substantive if substantive else user_msgs
+
+    for msg in messages_to_use[-4:]:
+        parts.append(f"Student: {msg}")
+
+    return "\n".join(parts)
+
+
+async def _retitle_thread(
+    user_id: str,
+    thread_id: str,
+    message_or_context: str,
+    state: SessionState | None = None,
+) -> None:
+    """Replace a generic or first-message label with a generated one. Never raises."""
+    if not message_or_context or chat_history.is_greeting_or_generic(message_or_context):
+        return
+    try:
+        title = await generate_title(message_or_context)
+        if title and not chat_history.is_generic_title(title):
+            if await chat_history.update_thread_title(user_id, thread_id, title):
+                if state is not None:
+                    state.saved_title = title
+    except Exception as exc:  # noqa: BLE001 - a background task must not escape
+        logger.info("Could not retitle thread %s: %s", thread_id, exc)
+
+
+async def _maybe_retitle_thread(
+    user: AuthenticatedUser | None,
+    thread_id: str | None,
+    state: SessionState,
+    current_message: str | None = None,
+) -> None:
+    """Evaluate whether this thread needs its title created or upgraded after a turn. Never raises."""
+    if user is None or user.is_anonymous or thread_id is None:
+        return
+
+    # 1. Deterministic profile-based topic title (highest priority)
+    p_title = profile_title(state)
+    if p_title and p_title != state.saved_title:
+        if await chat_history.update_thread_title(user.id, thread_id, p_title):
+            state.saved_title = p_title
+            return
+
+    # 2. Check if we should generate an intent-based title with the LLM.
+    # Re-trigger when:
+    # - The saved title is generic ('New conversation', greeting, or empty) and substantive context exists
+    # - Or we are in early turns (turns 2-4) and the saved title is still just the raw first message slice
+    current_saved = state.saved_title
+    is_saved_generic = chat_history.is_generic_title(current_saved)
+
+    user_msgs = [m.content.strip() for m in state.messages if m.role == "user" and m.content.strip()]
+    turn_count = len(user_msgs)
+
+    should_generate = False
+    if is_saved_generic:
+        context = extract_title_context(state, current_message)
+        if context and not chat_history.is_greeting_or_generic(context):
+            should_generate = True
+    elif turn_count in (2, 3, 4) and current_saved and not p_title:
+        first_raw = user_msgs[0] if user_msgs else ""
+        if current_saved == chat_history.derive_title(first_raw):
+            context = extract_title_context(state, current_message)
+            if context and len(user_msgs) >= 2:
+                should_generate = True
+
+    if should_generate:
+        context = extract_title_context(state, current_message)
+        if context and not chat_history.is_greeting_or_generic(context):
+            task = asyncio.create_task(
+                _retitle_thread(user.id, thread_id, context, state=state)
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+
+
+async def _save_artifact(
+    user: AuthenticatedUser | None,
+    thread_id: str | None,
+    *,
+    kind: str,
+    summary: str,
+    payload: dict[str, Any],
+) -> None:
+    """Store a rendered artifact in the transcript. Never raises.
+
+    `summary` is the readable `content` every row carries, so a reader that
+    knows nothing about payloads still sees something sensible where the card
+    appeared.
+    """
+    if user is None or thread_id is None:
+        return
+    await chat_history.append_message(
+        user.id,
+        thread_id,
+        sender="system",
+        content=summary,
+        kind=kind,
+        payload=payload,
+    )
+
+
+async def _save_turn(
+    user: AuthenticatedUser | None,
+    thread_id: str | None,
+    message: str,
+    reply: str,
+) -> None:
+    """Write one exchange. Failures are logged, never raised.
+
+    Called after the reply has finished streaming rather than per token: a
+    hundred inserts per turn would cost more than the conversation, and a
+    half-written reply is not worth saving anyway.
+    """
+    if user is None or thread_id is None:
+        return
+    if message.strip():
+        await chat_history.append_message(
+            user.id, thread_id, sender="user", content=message
+        )
+    if reply.strip():
+        await chat_history.append_message(
+            user.id, thread_id, sender="assistant", content=reply
+        )
+
+
+async def _emit_matches(
+    state: SessionState,
+    card: DiagnosticCardPayload,
+    *,
+    user: AuthenticatedUser | None = None,
+    thread_id: str | None = None,
+) -> AsyncIterator[str]:
+    """Search the course index and emit the matches, or say why there are none.
+
+    A failure here must never break the stream: the diagnostic report is
+    already delivered and useful on its own, so the course index being down
+    is a degraded turn, not a failed one.
+    """
+    try:
+        result = await find_matches(state, card)
+    except MatchingUnavailable as exc:
+        logger.warning("Course matching unavailable for %s: %s", state.session_id, exc)
+        if exc.quota_exhausted:
+            message = (
+                "Your diagnostic report is ready. Programme matching is paused "
+                "until tomorrow - the daily search allowance for this service "
+                "has been used up. It resets automatically; everything else on "
+                "this page still stands."
+            )
+        else:
+            message = (
+                "Your diagnostic report is ready, but I could not reach the "
+                "course index just now, so there are no programme matches "
+                "below. Everything else on this page still stands."
+            )
+        yield _frame(
+            SSEEventType.ERROR, {"message": message, "recoverable": True}
+        )
+        return
+
+    # An empty result is information, not a fault: it rides on the same event
+    # as a full one, with a note saying which part of the profile nothing in
+    # the index satisfies, so the student knows what to change.
+    state.last_matches = result.matches
+    matches_payload = {
+        "session_id": state.session_id,
+        "query": build_query(state),
+        "matches": result.matches,
+        "note": _no_match_note(state, result),
+        "from_related_fields": result.from_related_fields,
+        "guidance": build_guidance(state, result.matches),
+    }
+    yield _frame(SSEEventType.UNIVERSITY_MATCHES, matches_payload)
+    await _save_artifact(
+        user,
+        thread_id,
+        kind="university_matches",
+        summary=f"{len(result.matches)} matching programme(s)",
+        payload=matches_payload,
+    )
+
+
+def _no_match_note(state: SessionState, result: MatchResult) -> str | None:
+    """Say what the index was searched for, so an empty grid is not a mystery."""
+    shortfall = result.shortfall
+    if shortfall is None:
+        return None
+
+    slots = state.slots
+    # Written out, so the note reads "close enough to Artificial Intelligence"
+    # rather than "close enough to Ai" - and names the subject the search
+    # actually looked for.
+    subject = expand_field(slots.field_of_study) or "your subject"
+
+    if shortfall == "subject":
+        # Programmes exist that they qualify for, but none are in their field.
+        # Listing them anyway is what produced data-science degrees for an
+        # English Literature graduate, so they are withheld and explained.
+        return (
+            f"Nothing in the course index is close enough to {subject} to be "
+            "worth recommending. There are programmes you qualify for, but "
+            "they are in other disciplines, and a degree in the wrong subject "
+            "is not a shortlist. Ingest course pages in your field and they "
+            "will appear here."
+        )
+
+    where = slots.target_country or "your destination"
+    wanted = target_degree_levels(slots.education_level)
+    level = f" at {wanted[0]} level" if wanted else ""
+
+    if shortfall == "requirements":
+        # The courses are there; the student does not clear their bar. Saying
+        # the catalogue is empty would be false, and would hide the one thing
+        # they can actually act on - which the report above already names.
+        count = result.catalogue_count
+        plural = "" if count == 1 else "s"
+        gaps: list[str] = []
+        held = slots.language_score.overall if slots.language_score else None
+        if result.lowest_ielts_required and (
+            held is None or held < result.lowest_ielts_required
+        ):
+            have = f"you have {held:g}" if held is not None else "you have not sat it"
+            gaps.append(
+                f"IELTS {result.lowest_ielts_required:g} ({have})"
+            )
+        card = state.last_card
+        percent = card.conversion.normalized_percentage if card else None
+        if result.lowest_gpa_required and (
+            percent is None or percent < result.lowest_gpa_required
+        ):
+            have = f"yours converts to {percent:g}%" if percent is not None else ""
+            gaps.append(
+                f"{result.lowest_gpa_required:g}% academic{f' ({have})' if have else ''}"
+            )
+
+        reason = (
+            " The least demanding asks for " + " and ".join(gaps) + "."
+            if gaps
+            else " None of them accepts your profile as it stands."
+        )
+        return (
+            f"There {'is' if count == 1 else 'are'} {count} programme{plural} in "
+            f"{where}{level} in the index, but you do not yet meet the entry "
+            f"requirements.{reason} This is about the bar, not the catalogue - "
+            "closing that gap puts them in reach."
+        )
+
+    return (
+        f"Nothing in the course index is in {where}{level} yet. The index only "
+        "holds programmes that have been crawled, so this is a gap in the "
+        "catalogue rather than anything about your grades - your report above "
+        "stands. Widen the destination, or ingest the course pages you care "
+        "about."
+    )
+
+
 def _restrict_to_confirmation(
     patch: SlotPatch, state: SessionState
 ) -> tuple[SlotPatch, list[SlotName]]:
@@ -626,7 +1638,10 @@ def _plan_turn(
     noise: bool = False,
     deferred: list[SlotName] | None = None,
     ambiguous_country: str | None = None,
+    multi_country: list[str] | None = None,
     same_country_as_home: str | None = None,
+    grade_change: AcademicScore | None = None,
+    awaiting_transcript: bool = False,
 ) -> tuple[str, str, Any]:
     """Build the directive + deterministic fallback, and the card when unlocked.
 
@@ -728,6 +1743,41 @@ def _plan_turn(
         state.awaiting = []
         return directive, fallback, None
 
+    if awaiting_transcript:
+        directive = (
+            "The student has asked for their transcript to be read but has not "
+            "attached it yet. Reply with ONE short sentence confirming you will "
+            "read it once they share it. Do not ask for their name, their "
+            "country, their grade, or anything else - the document carries "
+            "those, and asking reads as not having listened. Do not list what "
+            "you will extract. Stop after that one sentence."
+        )
+        fallback = (
+            "I can certainly help you look through your transcript once you "
+            "share it with me."
+        )
+        # The next message is the upload, or a question about it - not an
+        # answer to a slot nobody asked for.
+        state.awaiting = []
+        return directive, fallback, None
+
+    if grade_change is not None:
+        was = _describe_score(state.slots.cgpa)
+        now = _describe_score(grade_change)
+        directive = (
+            f"The student already gave their grade as {was}, and has now said "
+            f"{now}. Do not record the new one yet and do not claim to have "
+            "updated anything. Ask, in one short sentence, whether they want "
+            f"to replace {was} with {now}. A yes replaces it; a no keeps the "
+            "original."
+        )
+        fallback = (
+            f"You already told me {was}. Do you want to change that to {now}?"
+        )
+        # The next reply answers this question, not a slot in the usual order.
+        state.awaiting = []
+        return directive, fallback, None
+
     if same_country_as_home:
         directive = (
             f"The student named {same_country_as_home} as where they want to "
@@ -743,6 +1793,24 @@ def _plan_turn(
             f"studying there would not be studying abroad. Did you mean "
             f"{same_country_as_home} itself, or a different country?"
         )
+        state.awaiting = []
+        return directive, fallback, None
+
+    if multi_country:
+        listed = _list_countries(multi_country)
+        directive = (
+            f"The student named more than one destination: {listed}. Do not "
+            "record any of them yet and do not claim to have noted them. Ask, "
+            "in one short sentence, whether they would like the shortlist to "
+            f"cover all of {listed}, or just one - and if one, which. Say that "
+            "searching several is fine."
+        )
+        fallback = (
+            f"You mentioned {listed}. Shall I search all of them, or would you "
+            "rather focus on one? Either is fine - just say yes, or name the "
+            "one you want."
+        )
+        # The next reply answers this question, not a slot in the usual order.
         state.awaiting = []
         return directive, fallback, None
 
@@ -769,11 +1837,16 @@ def _plan_turn(
             f"Known so far: {known}. Still missing: "
             f"{', '.join(SLOT_LABELS[n] for n in missing)}. "
             f"Acknowledge what they just said, then ask for {wanted}. "
+            "Ask for nothing else. The fields listed as missing are the only "
+            "ones that exist - there is no budget, funding, scholarship, "
+            "start date, work-experience or preferred-university field, and "
+            "asking for one invents a requirement the student then thinks "
+            "they have to meet. "
             "The known list is the only record: never state a value as settled "
             "just because it came up earlier in the conversation. If something "
             "was mentioned but is not in that list, it was not recorded - ask "
             "for it rather than repeating it back as fact. "
-            "Do not produce any diagnostic report yet."
+            "Do not produce any diagnostic report yet." + NO_INVENTED_SPECIFICS
         )
         opener = (
             "Thanks for the transcript! " if had_upload else ""
@@ -802,16 +1875,23 @@ def _plan_turn(
     # The report is produced once. Re-sending the card on every later message
     # would re-announce results the student is already looking at, and would
     # answer an unrelated question with a wall of numbers.
-    if state.diagnostics_unlocked and not slots_changed:
+    #
+    # The test is the card's *contents*, not whether a slot was touched: asking
+    # "shortlist some universities" makes the extractor re-state the country it
+    # already knows, and a re-stated value used to count as a change and print
+    # a second, identical report. A genuine correction - a fixed CGPA, a new
+    # destination - still produces a new card, because that one differs.
+    if state.diagnostics_unlocked and _same_report(card, state.last_card):
         directive = (
             "The diagnostic report has already been delivered and is on screen; "
             "every onboarding field is collected. Answer the student's message "
             "conversationally as their advisor. Do not restate the converted "
-            "grades unless they ask for them, and do not re-run the report."
+            "grades unless they ask for them, and do not re-run the report. "
+            + SHORTLIST_DIRECTIVE
         )
         fallback = (
-            "Your diagnostic report is above. Ask me anything about it — or say "
-            "the word and I will put together a university shortlist next."
+            "Your diagnostic report and programme shortlist are above. Ask me "
+            "anything about them."
         )
         state.awaiting = []
         return directive, fallback, None
@@ -825,18 +1905,31 @@ def _plan_turn(
         f"US GPA {conversion.us_gpa:g} ({conversion.us_letter}), German grade "
         f"{conversion.german_grade:g} ({conversion.german_label}), UK "
         f"{conversion.uk_classification.value}, ECTS {conversion.ects_grade}. "
-        f"Target country: {state.slots.target_country}. "
+        # Every confirmed destination, not just the primary. Naming one after
+        # the student asked for two left the model to improvise cover for the
+        # other, which is where the invented universities came from.
+        f"Destinations the student has confirmed: "
+        f"{_list_countries(state.slots.destinations())}. "
         f"Key points to weave in: {' '.join(card.eligibility_notes[:3])} "
-        "Do not recompute anything. End by telling them a detailed card is shown "
-        "below and asking if they want a university shortlist next."
+        "Do not recompute anything. End by telling them a detailed card and "
+        "matching programmes are shown below." + SHORTLIST_DIRECTIVE
     )
     state.awaiting = []
+    # This is the reply, not a backup for one: the report turn does not go
+    # through the model. Every figure here is the computed conversion, and the
+    # destinations are the ones actually recorded - so the prose cannot drift
+    # from the card and grid printed underneath it.
+    where = _list_countries(state.slots.destinations())
     fallback = (
         f"Here is where you stand, {state.slots.full_name or 'there'}. Your "
-        f"{conversion.source_value:g} converts to {conversion.normalized_percentage:g}% "
-        f"overall — a {conversion.us_gpa:g} US GPA, a German {conversion.german_grade:g} "
-        f"({conversion.german_label}), and a UK {conversion.uk_classification.value}. "
-        "The card below breaks it down system by system."
+        f"{conversion.source_value:g} converts to "
+        f"{conversion.normalized_percentage:g}% overall — a "
+        f"{conversion.us_gpa:g} US GPA ({conversion.us_letter}), a German "
+        f"{conversion.german_grade:g} ({conversion.german_label}), and a UK "
+        f"{conversion.uk_classification.value}. The card below breaks it down "
+        "system by system"
+        + (f", and the programmes matched for {where} follow underneath it."
+           if where else ", and the matching programmes follow underneath it.")
     )
     return directive, fallback, card
 
@@ -850,6 +1943,24 @@ SCALE_SUFFIX: Final[dict[str, str]] = {
     "german_1_5": " (German scale)",
     "unknown": "",
 }
+
+
+def _same_report(card: DiagnosticCardPayload, previous: DiagnosticCardPayload | None) -> bool:
+    """Would this card tell the student anything the last one did not?
+
+    Only the conversion is compared. The card is a report about a *grade*:
+    the percentage, the US GPA, the German and UK equivalents. Saying "I want
+    to study business instead" changes none of those numbers, yet comparing
+    whole payloads treated it as a new report - so the card was reprinted in
+    full every time the student refined what they were looking for, which is
+    exactly the turn where they want the shortlist, not the arithmetic again.
+
+    A corrected CGPA or nationality does move the conversion, and that does
+    warrant a fresh card.
+    """
+    if previous is None:
+        return False
+    return card.conversion.model_dump() == previous.conversion.model_dump()
 
 
 def _render(value: Any) -> str:
@@ -884,6 +1995,8 @@ def _session_snapshot(state: SessionState) -> dict[str, Any]:
         "diagnostics_unlocked": state.diagnostics_unlocked,
         "transcript": state.transcript.model_dump(mode="json") if state.transcript else None,
         "last_card": state.last_card.model_dump(mode="json") if state.last_card else None,
+        "last_matches": state.last_matches,
+        "transcript_parsed": state.transcript_parsed,
         "messages": [m.model_dump(mode="json") for m in state.messages],
     }
 

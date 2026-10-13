@@ -59,6 +59,15 @@ Read the academic transcript and return ONLY a JSON object with these keys:
 Rules:
 - Transcribe only what is printed. Never estimate a GPA that is not shown; \
 leave it null and note it in "warnings".
+- The final cumulative result is normally printed at the very end of a \
+transcript - the last rows of the last page, a summary block, or a footer - \
+rather than beside the subject list. Read the bottom of the document before \
+concluding that no overall grade is stated. It may be labelled CGPA, \
+Cumulative GPA, Overall GPA, Final CGPA, Aggregate or Grand Total, and may \
+sit in a summary table with total credits earned.
+- Per-semester or per-year totals are not the cumulative figure. When several \
+are shown, "cumulative_gpa" is the final overall one, not the latest \
+semester's.
 - "gpa_scale_max" is the maximum possible GPA stated on the document (4.0, \
 5.0, 10.0, 20.0 or 100 for percentages).
 - "education_level" comes from the programme name: "BS/BSc/BA/BFA/BE/BTech" \
@@ -136,15 +145,47 @@ async def parse_transcript(
     return _post_process(transcript)
 
 
+def _is_about_missing_cgpa(note: str) -> bool:
+    """True when a model-written warning already says the total is absent.
+
+    Matched on meaning rather than wording, because the phrasing varies run to
+    run: "not explicitly stated as a single final value", "no cumulative GPA
+    found", "CGPA is not printed". Deliberately narrow - a warning about
+    anything else, such as grades shown for unfinished courses, must survive,
+    since that one explains a genuinely different problem.
+    """
+    lowered = note.lower()
+    mentions_total = any(
+        term in lowered for term in ("cgpa", "cumulative gpa", "overall gpa")
+    )
+    says_absent = any(
+        term in lowered
+        for term in ("not explicitly", "not stated", "not printed", "not shown",
+                     "no cumulative", "no overall", "not available", "absent",
+                     "could not find", "not found", "not provided")
+    )
+    return mentions_total and says_absent
+
+
 def _post_process(transcript: ExtractedTranscript) -> ExtractedTranscript:
     """Derive what the document left implicit, without inventing grades."""
     if transcript.cumulative_gpa is None and transcript.percentage is None:
         derived = weighted_cumulative(transcript.subjects)
         if derived is not None:
             transcript.cumulative_gpa = derived
+            transcript.cumulative_gpa_computed = True
+            # The model usually notes the missing total itself, in its own
+            # words. Appending this unconditionally printed the same fact
+            # twice, which reads as two separate problems rather than one.
+            # Replace its version, since only this one says what was done
+            # about it and what the student should check.
+            transcript.warnings = [
+                note for note in transcript.warnings if not _is_about_missing_cgpa(note)
+            ]
             transcript.warnings.append(
-                "No overall CGPA was printed; it was computed from the listed "
-                "subject grades and should be confirmed."
+                "No overall CGPA was printed on this document, so it was "
+                "averaged from the subject grades. Your official CGPA may "
+                "differ - please check it against your transcript."
             )
 
     if not transcript.backlogs and transcript.failed_subjects:
@@ -263,9 +304,22 @@ def _render_pdf_pages(content: bytes) -> list[bytes]:
             "That PDF could not be opened. It may be corrupted or password protected."
         ) from exc
 
+    # Which pages, when there are more than the cap allows.
+    #
+    # Taking the first N dropped the last page, and the final cumulative total
+    # is printed at the end of a transcript - so on any document longer than
+    # the cap the one figure that matters was guaranteed to be missing, and
+    # the grade got averaged from subjects instead. The tail is kept for that
+    # reason; the opening pages carry the name, institution and programme.
+    total = len(document)
+    if total <= MAX_PDF_PAGES:
+        indices = list(range(total))
+    else:
+        indices = list(range(MAX_PDF_PAGES - 1)) + [total - 1]
+
     pages: list[bytes] = []
     try:
-        for index in range(min(len(document), MAX_PDF_PAGES)):
+        for index in indices:
             page = document[index]
             bitmap = page.render(scale=PDF_RENDER_SCALE)
             buffer = bitmap.to_pil()

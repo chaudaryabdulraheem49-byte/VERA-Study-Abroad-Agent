@@ -89,10 +89,14 @@ class LanguageTest(StrEnum):
 class SSEEventType(StrEnum):
     """Wire contract shared with the Next.js client."""
 
-    TOKEN = "token"
+    # Wire name is "text_delta": the frames carry an incremental slice of the
+    # reply, and naming them for what they are keeps the contract readable
+    # from the client side.
+    TOKEN = "text_delta"
     SLOT_UPDATE = "slot_update"
     TRANSCRIPT_PARSED = "transcript_parsed"
     DIAGNOSTIC_CARD = "diagnostic_card"
+    UNIVERSITY_MATCHES = "university_matches"
     STATUS = "status"
     ERROR = "error"
     DONE = "done"
@@ -182,6 +186,11 @@ class OnboardingSlots(BaseModel):
     field_of_study: str | None = None
     education_level: EducationLevel | None = None
     target_country: str | None = None
+    # Further destinations, once the student has confirmed they want more than
+    # one. `target_country` stays the primary: the diagnostic report's advice
+    # is country-specific ("Canadian universities typically ask for..."), so
+    # one of them has to lead. The search spans all of them equally.
+    extra_countries: list[str] = Field(default_factory=list)
     language_score: LanguageScore | None = None
 
     # Provenance: which slots came from OCR vs. chat. Drives the confirmation step.
@@ -198,6 +207,12 @@ class OnboardingSlots(BaseModel):
             elif name is SlotName.LANGUAGE_SCORE and not value.is_satisfied():
                 gaps.append(name)
         return gaps
+
+    def destinations(self) -> list[str]:
+        """Every confirmed destination, primary first."""
+        if not self.target_country:
+            return []
+        return [self.target_country, *self.extra_countries]
 
     def is_complete(self) -> bool:
         return not self.missing()
@@ -224,15 +239,52 @@ class OnboardingSlots(BaseModel):
             if current is not None and from_ocr and name not in self.ocr_derived:
                 continue  # never let OCR clobber what the student typed
             if current == new_value:
+                # Companions still have to land when the primary is unchanged.
+                # "Australia and Canada" from a student already recorded as
+                # Australia moves only `extra_countries`, so skipping here
+                # dropped Canada without a word. Guarded on the patch actually
+                # carrying companions, so merely re-stating the destination
+                # does not wipe the ones already agreed.
+                if (
+                    name is SlotName.TARGET_COUNTRY
+                    and patch.extra_countries
+                    and list(patch.extra_countries) != self.extra_countries
+                ):
+                    self.extra_countries = list(patch.extra_countries)
+                    changed.append(name)
                 continue
             setattr(self, name.value, new_value)
             changed.append(name)
+            if name is SlotName.TARGET_COUNTRY:
+                # A newly chosen primary destination replaces the companions
+                # rather than accumulating with them - "actually, just Canada"
+                # has to be able to clear the list.
+                self.extra_countries = list(patch.extra_countries)
             if from_ocr:
                 self.ocr_derived.add(name)
                 self.user_confirmed.discard(name)
             else:
                 self.user_confirmed.add(name)
         return changed
+
+
+# The forms a model actually writes when asked for a level. Prose ("I did my
+# bachelors in 2019") is handled by the extractor's own patterns; this only
+# has to stop a reasonable label from failing validation.
+_LEVEL_ALIASES: Final[dict[str, str]] = {
+    "high_school": "high_school", "highschool": "high_school",
+    "intermediate": "high_school", "secondary": "high_school",
+    "senior_secondary": "high_school", "a_levels": "high_school",
+    "diploma": "diploma", "advanced_diploma": "diploma",
+    "associate_degree": "diploma",
+    "bachelor": "bachelors", "bachelors": "bachelors",
+    "bachelor's": "bachelors", "bachelors_degree": "bachelors",
+    "undergraduate": "bachelors",
+    "master": "masters", "masters": "masters", "master's": "masters",
+    "masters_degree": "masters", "postgraduate": "masters", "msc": "masters",
+    "phd": "doctorate", "ph_d": "doctorate", "doctorate": "doctorate",
+    "doctoral": "doctorate", "doctoral_degree": "doctorate",
+}
 
 
 class SlotPatch(BaseModel):
@@ -245,8 +297,32 @@ class SlotPatch(BaseModel):
     cgpa: AcademicScore | None = None
     field_of_study: str | None = None
     education_level: EducationLevel | None = None
+    # The level the student wants to *study at*, which is not the level they
+    # hold. "I want to study business in masters" says nothing about their
+    # existing qualification, and reading it as one flips a Bachelor's holder
+    # to Master's - after which the search offers them PhDs.
+    desired_level: EducationLevel | None = None
     target_country: str | None = None
+    # Companion destinations, confirmed alongside the primary one. Not a
+    # slot, so the merge loop never sees it - it is carried explicitly.
+    extra_countries: list[str] = Field(default_factory=list)
     language_score: LanguageScore | None = None
+    @field_validator("education_level", "desired_level", mode="before")
+    @classmethod
+    def _coerce_level(cls, value: Any) -> Any:
+        """Accept the label a model is likely to write, not just the value.
+
+        Without this the enum rejects "Masters" outright and Pydantic fails
+        the *whole* patch - so one stylistic choice by the model throws away
+        every other field it correctly extracted, and the turn silently falls
+        back to regex. Prose is still handled further on; this only has to
+        cover the handful of forms a model actually emits.
+        """
+        if not isinstance(value, str):
+            return value
+        key = value.strip().lower().replace("-", "_").replace(" ", "_")
+        return _LEVEL_ALIASES.get(key, key)
+
     confirms_ocr: bool = Field(
         default=False,
         description="True when the message affirms previously OCR-extracted values.",
@@ -290,6 +366,13 @@ class ExtractedTranscript(BaseModel):
     backlogs: int = Field(default=0, ge=0)
     failed_subjects: list[str] = Field(default_factory=list)
     gap_years: float | None = Field(default=None, ge=0)
+
+    # True when no overall grade was printed and one was averaged from the
+    # subject list instead. The distinction matters to the student: a computed
+    # figure can disagree with their official CGPA, because an institution's
+    # own formula may weight, cap or exclude attempts in ways a plain average
+    # does not. Defaulted, so older saved transcripts still load.
+    cumulative_gpa_computed: bool = False
 
     graduation_year: int | None = None
     confidence: Confidence = 0.0
@@ -424,9 +507,15 @@ class SessionState(BaseModel):
     session_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     slots: OnboardingSlots = Field(default_factory=OnboardingSlots)
     transcript: ExtractedTranscript | None = None
+    # True once a transcript has been read for this session, whether it was
+    # dropped into the chat or posted to /api/chat/upload.
+    transcript_parsed: bool = False
     messages: list[ChatMessage] = Field(default_factory=list)
     diagnostics_unlocked: bool = False
     last_card: DiagnosticCardPayload | None = None
+    # The matches that accompanied the last card. Kept so reloading the
+    # page restores the grid alongside the report it belongs to.
+    last_matches: list[dict[str, Any]] = Field(default_factory=list)
     # Slots the last assistant turn asked for. A bare reply ("Usama khan") is
     # resolved against these, since it carries no phrasing to pattern-match on.
     awaiting: list[SlotName] = Field(default_factory=list)
@@ -438,6 +527,28 @@ class SessionState(BaseModel):
     # home is not what this service is for, so it is confirmed rather than
     # recorded - it is usually a mis-typed answer.
     pending_same_country: str | None = None
+    # Two or more destinations named in one message, held unassigned until the
+    # student says whether they meant all of them. Storing the first and
+    # dropping the rest is silent: the discarded one is never mentioned again,
+    # so there is nothing to notice.
+    pending_multi_country: list[str] = Field(default_factory=list)
+    # A grade that contradicts one the student already gave. Overwriting it
+    # silently is the worst kind of quiet change: every downstream figure - the
+    # conversion, the eligibility filter, the shortlist - moves with it, and
+    # nothing on screen says the old number is gone. So it is confirmed first.
+    pending_grade: AcademicScore | None = None
+    # The label last written to this conversation's saved thread. Kept so a
+    # profile that has not changed does not trigger the same rename on every
+    # later turn.
+    saved_title: str | None = None
+    # A level the student asked for in so many words. It overrides the level
+    # inferred from what they hold, because a stated preference beats an
+    # inference every time.
+    desired_level: EducationLevel | None = None
+    # The saved conversation this session is writing to, when the student is
+    # signed in and history is configured. None means the turn is not being
+    # persisted, which is a normal state rather than an error.
+    thread_id: str | None = None
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
 

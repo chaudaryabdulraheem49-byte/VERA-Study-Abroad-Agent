@@ -202,6 +202,100 @@ asking, not telling."""
 # --------------------------------------------------------------------------- #
 
 
+# A sidebar label, not a sentence. Short enough to read at a glance in a
+# narrow column, long enough to tell two conversations apart.
+TITLE_MAX_CHARS: Final = 35
+
+_TITLE_PROMPT: Final = """You name conversations for a study-abroad advisor.
+
+Write a short, intent-based title: 3-5 words, at most 35 characters.
+
+Rules:
+- Prefer degree + field + country, or the student's name + what they want.
+- Use only what the messages actually say. Never invent a country, a subject
+  or a name that is not there - a wrong label on someone's saved conversation
+  is worse than a vague one.
+- If the messages say almost nothing, describe the intent loosely rather than
+  guessing: "Getting started" beats a fabricated specific.
+- No prefix, no quotes, no emoji, no trailing full stop. Capitalise properly.
+
+Examples:
+"I want to study in Australia for Masters in CS" -> Masters in CS - Australia
+"this is ali from pakistan, i want to go uk" -> Ali - Study in UK
+"hey" / "What can I do with a 2.5 GPA?" -> Low GPA Options
+"hassan here from pakistan" -> Hassan - Pakistan to Abroad
+
+Messages:
+{messages}
+
+Reply with the title alone."""
+
+
+async def generate_title(messages: str) -> str | None:
+    """A readable label for a saved conversation, or None if unavailable.
+
+    None rather than a placeholder: the caller already stored a title taken
+    from the first message, and keeping that is better than replacing it with
+    something emptier. This only ever upgrades a label.
+
+    Runs once per conversation, not per message.
+    """
+    client = get_client()
+    if client is None:
+        return None
+
+    settings = get_settings()
+    try:
+        response = await client.chat.completions.create(
+            model=settings.chat_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": _TITLE_PROMPT.format(messages=messages.strip()[:2000]),
+                }
+            ],
+            temperature=0.3,
+            max_tokens=20,
+        )
+    except Exception as exc:  # noqa: BLE001 - provider SDKs raise broadly
+        # Never surfaced: a conversation without a tidy label still works.
+        logger.info("Title generation failed, keeping the existing label: %s", exc)
+        return None
+
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return None
+    return _clean_title(choices[0].message.content)
+
+
+def _clean_title(raw: str | None) -> str | None:
+    """Strip the wrappers models add despite being told not to."""
+    if not raw:
+        return None
+    text = " ".join(raw.split())
+    # "Title: Masters in CS" - the one instruction models ignore most.
+    for prefix in ("title:", "chat title:", "conversation title:"):
+        if text.lower().startswith(prefix):
+            text = text[len(prefix) :].strip()
+    text = text.strip("\"'“”‘’ ").rstrip(".")
+    if not text:
+        return None
+    # Checked before truncation, not after: a model that replied with a
+    # sentence has not produced a title, and cutting it to 35 characters would
+    # hide that by turning the first few words into a plausible-looking one.
+    if len(text.split()) > 8:
+        return None
+    if len(text) > TITLE_MAX_CHARS:
+        trimmed = text[:TITLE_MAX_CHARS].rsplit(" ", 1)[0]
+        text = trimmed or text[:TITLE_MAX_CHARS]
+
+    words = text.split()
+    while words and words[-1].lower() in {"in", "to", "for", "and", "of", "with", "at", "by", "-", ":"}:
+        words.pop()
+    text = " ".join(words).rstrip(" -:")
+    return text or None
+
+
 async def stream_reply(
     state: SessionState,
     directive: str,
@@ -355,15 +449,32 @@ def _normalise_patch(patch: SlotPatch) -> SlotPatch:
         # trimming applies to their output as to our own patterns.
         patch.full_name = strip_name_filler(patch.full_name.strip())
 
+        # Keyboard mashing answers the question syntactically, so a model will
+        # file "dldajsfdk" as a name without hesitating. The regex path already
+        # refused it; this applies the same test to the model's output, which
+        # was the only route by which it reached the profile.
+        #
+        # Checked against 34 names spanning Polish, Yoruba, Zulu, Vietnamese,
+        # Mandarin and Arabic with no false positives - wrongly refusing a real
+        # person's name is far worse than storing one odd-looking string.
+        if patch.full_name and looks_like_noise(patch.full_name):
+            logger.info("Refusing an unpronounceable name: %r", patch.full_name)
+            patch.full_name = None
+
     # A field of study is a subject - graphic design, IT, economics. The model
     # sometimes files a destination there ("in uk"), so anything that resolves
     # to a country is dropped rather than shown as the student's major.
-    if patch.field_of_study and _lookup_country(patch.field_of_study):
+    if patch.field_of_study and (
+        _lookup_country(patch.field_of_study) or _is_level_only(patch.field_of_study)
+    ):
         patch.field_of_study = None
 
     if isinstance(patch.education_level, str):
         # Models sometimes answer with a label rather than the enum value.
         patch.education_level = _extract_level(patch.education_level)
+
+    if isinstance(patch.desired_level, str):
+        patch.desired_level = _extract_level(patch.desired_level)
 
     for field in ("nationality", "target_country"):
         value = getattr(patch, field)
@@ -373,6 +484,14 @@ def _normalise_patch(patch: SlotPatch) -> SlotPatch:
         canonical = _canonical_country(value)
         if canonical:
             setattr(patch, field, canonical)
+            continue
+
+        # A phrase naming exactly one country we recognise resolves to it:
+        # "the UK" and "study in Germany" should not be stored as prose. More
+        # than one is left alone here for the caller to ask about.
+        inside = extract_countries(value)
+        if len(inside) == 1:
+            setattr(patch, field, inside[0])
         elif value.islower() or value.isupper():
             setattr(patch, field, _title(value))
     return patch
@@ -403,6 +522,14 @@ def _merge_patches(*, primary: SlotPatch, secondary: SlotPatch) -> SlotPatch:
             if value is not None:
                 setattr(merged, name.value, value)
     merged.confirms_ocr = primary.confirms_ocr or secondary.confirms_ocr
+    # Not a slot, so the loop above never sees it. Left out, a stated
+    # preference ("I want to study masters") was found by the heuristic and
+    # then silently dropped on every turn the model ran - which is every turn.
+    if merged.desired_level is None:
+        merged.desired_level = secondary.desired_level
+    # Also not a slot, so also invisible to the loop above.
+    if not merged.extra_countries:
+        merged.extra_countries = list(secondary.extra_countries)
     return merged
 
 
@@ -430,6 +557,17 @@ _CONFIRMATION_RE: Final = re.compile(
 _CGPA_RE: Final = re.compile(
     r"(?:cgpa|gpa|grade|percentage|marks|scored?)\D{0,20}?(\d{1,3}(?:\.\d{1,2})?)\s*"
     r"(%|percent)?(?:\s*(?:/|out of)\s*(\d{1,3}(?:\.\d{1,2})?))?",
+    re.IGNORECASE,
+)
+# The same figure with its label after it: "a 3.2 GPA", "3.2/4.0 CGPA".
+# _CGPA_RE only reads keyword-then-number, so without this "I have a 3.2 GPA"
+# is a self-reported grade that goes unrecorded. Deliberately narrower than
+# _CGPA_RE - only gpa/cgpa, and the number must sit against the label, so an
+# unrelated figure earlier in the sentence cannot be swept up. Groups are
+# numbered to match _CGPA_RE, since both feed the same reader below.
+_CGPA_TRAILING_RE: Final = re.compile(
+    r"(\d{1,3}(?:\.\d{1,2})?)\s*(%|percent)?"
+    r"(?:\s*(?:/|out of)\s*(\d{1,3}(?:\.\d{1,2})?))?\s*c?gpa\b",
     re.IGNORECASE,
 )
 _BARE_PERCENT_RE: Final = re.compile(
@@ -519,8 +657,83 @@ _COUNTRIES.update(
         "united arab emirates": "UAE", "deutschland": "Germany",
         "holland": "Netherlands", "europe": "Europe", "eu": "Europe",
         "korea": "South Korea", "turkiye": "Turkey",
+        # Short forms students actually type. Listed rather than derived: the
+        # prefix rule needs four characters and the typo rule five, so "aus"
+        # and "nz" fell through both and were not recognised as countries at
+        # all - which let "aus" be filed as somebody's field of study.
+        "aus": "Australia", "aussie": "Australia", "oz": "Australia",
+        "nz": "New Zealand", "pak": "Pakistan", "ksa": "Saudi Arabia",
     }
 )
+
+# Demonyms, listed rather than derived. Some happened to resolve already by
+# falling through the typo tolerance - "indian" is one edit from "india" - but
+# that is luck, not coverage: "british" and "iranian" did not, and a demonym is
+# not a misspelling of its country.
+#
+# They matter beyond spelling. "I am Indian" states a citizenship outright,
+# where a bare "India" could be either slot; keeping them distinguishable is
+# what lets one be answered and the other asked about.
+_DEMONYMS: Final[dict[str, str]] = {
+    "pakistani": "Pakistan", "indian": "India", "bangladeshi": "Bangladesh",
+    "nepali": "Nepal", "nepalese": "Nepal", "sri lankan": "Sri Lanka",
+    "srilankan": "Sri Lanka", "afghan": "Afghanistan", "chinese": "China",
+    "japanese": "Japan", "korean": "South Korea", "vietnamese": "Vietnam",
+    "indonesian": "Indonesia", "malaysian": "Malaysia", "filipino": "Philippines",
+    "filipina": "Philippines", "thai": "Thailand", "singaporean": "Singapore",
+    "nigerian": "Nigeria", "ghanaian": "Ghana", "kenyan": "Kenya",
+    "egyptian": "Egypt", "moroccan": "Morocco", "ethiopian": "Ethiopia",
+    "turkish": "Turkey", "iranian": "Iran", "persian": "Iran", "iraqi": "Iraq",
+    "jordanian": "Jordan", "lebanese": "Lebanon", "saudi arabian": "Saudi Arabia",
+    "qatari": "Qatar", "german": "Germany", "french": "France",
+    "italian": "Italy", "spanish": "Spain", "portuguese": "Portugal",
+    "dutch": "Netherlands", "belgian": "Belgium", "swedish": "Sweden",
+    "norwegian": "Norway", "danish": "Denmark", "finnish": "Finland",
+    "polish": "Poland", "austrian": "Austria", "swiss": "Switzerland",
+    "irish": "Ireland", "greek": "Greece", "hungarian": "Hungary",
+    "czech": "Czechia", "romanian": "Romania", "ukrainian": "Ukraine",
+    "russian": "Russia", "canadian": "Canada", "australian": "Australia",
+    "brazilian": "Brazil", "mexican": "Mexico", "argentine": "Argentina",
+    "argentinian": "Argentina", "colombian": "Colombia", "chilean": "Chile",
+    "uzbek": "Uzbekistan", "kazakh": "Kazakhstan", "azerbaijani": "Azerbaijan",
+    "georgian": "Georgia", "american": "USA", "british": "UK",
+    "english": "UK", "scottish": "UK", "welsh": "UK", "emirati": "UAE",
+    "new zealander": "New Zealand", "kiwi": "New Zealand",
+    "south african": "South Africa",
+}
+
+
+def _title_country(name: str) -> str:
+    """Title-case a country name, leaving the connectives lowercase."""
+    words = name.split()
+    return " ".join(
+        word if index and word in {"of", "and", "the"} else word.title()
+        for index, word in enumerate(words)
+    )
+
+
+def country_aliases(canonical: str) -> list[str]:
+    """Every spelling that resolves to `canonical`, title-cased.
+
+    The interview canonicalises a destination ("england" -> "UK"), but a
+    crawled course page says whatever its own prose says - "United Kingdom" on
+    one, "England" on the next. The search filter compares country strings
+    exactly, so matching on the canonical form alone silently returns nothing.
+    Filtering on the whole alias set means the two sides agree however each one
+    happened to spell it.
+    """
+    target = _COUNTRIES.get(canonical.strip().lower(), canonical.strip())
+    names = {
+        _title_country(alias) if alias.islower() else alias
+        for alias, resolved in _COUNTRIES.items()
+        if resolved == target
+    }
+    names.add(target)
+    # "Uk" reads as a typo; the abbreviations keep the casing they are known by.
+    names = {target if name.lower() == target.lower() else name for name in names}
+    return sorted(names)
+
+
 # Space-free index, so "srilanka" and "newzealand" resolve, and so fuzzy
 # matching compares like with like.
 _COUNTRY_COMPACT: Final[dict[str, str]] = {
@@ -532,6 +745,11 @@ _COUNTRY_COMPACT: Final[dict[str, str]] = {
 # "I want to study in Germany" from capturing the phrase "study in germany".
 _COUNTRY_ALTERNATION: Final = "|".join(
     sorted((re.escape(name) for name in _COUNTRIES), key=len, reverse=True)
+)
+# Any country name, wherever it appears. Longest-first so "united states"
+# wins over "us", and word-bounded so "indiana" is not read as "india".
+_ANY_COUNTRY_RE: Final = re.compile(
+    r"\b(" + _COUNTRY_ALTERNATION + r")\b", re.IGNORECASE
 )
 _TARGET_RE: Final = re.compile(
     r"\b(?:to|in|for|towards?|target(?:ing)?|study in|apply to|move to|go to|"
@@ -585,8 +803,14 @@ _LEVEL_PATTERNS: Final[tuple[tuple[EducationLevel, str], ...]] = (
     ),
     (
         EducationLevel.HIGH_SCHOOL,
-        r"\b(intermediate|inter|f\.?sc|fsc|ics|i\.?com|icom|hssc|a[- ]?levels?|"
-        r"12th|twelfth|high ?school|senior secondary|matric|o[- ]?levels?)\b",
+        # "intermediate" is mistyped constantly - intermidiate, intermidate,
+        # intermedate - and it is the level a student is most likely to type
+        # out in full rather than abbreviate, so the spelling is matched
+        # loosely. The alternation is ordered longest-first so the full word
+        # wins over the bare "inter" prefix.
+        r"\b(inter ?m[ei]d[ei]?[ai]te|intermediate|inter|f\.?sc|fsc|ics|"
+        r"i\.?com|icom|hssc|a[- ]?levels?|12th|twelfth|high ?school|"
+        r"senior secondary|matric|o[- ]?levels?)\b",
     ),
 )
 _LEVEL_RES: Final[tuple[tuple[EducationLevel, "re.Pattern[str]"], ...]] = tuple(
@@ -632,6 +856,14 @@ def _looks_like_word(token: str) -> bool:
     letters = "".join(c for c in token.lower() if c.isalpha())
     if not letters:
         return any(c.isdigit() for c in token)
+
+    # One character held down. It has vowels, no consonant run and no keyboard
+    # run, so every test below passes it - "aaaaaa" was reaching the profile as
+    # a name. Checked before the short-token exemption, since "aaaa" is no more
+    # a name than "aaaaaa" is.
+    if len(set(letters)) == 1 and len(letters) >= 3:
+        return False
+
     if len(letters) <= 4:
         return True
     if _has_keyboard_run(letters):
@@ -646,6 +878,36 @@ def _looks_like_word(token: str) -> bool:
     return True
 
 
+# What students call the document, including the South Asian terms, since the
+# register this serves is largely Pakistani and Indian.
+_TRANSCRIPT_NOUN = (
+    r"(?:transcript|marks?\s?sheet|result\s?card|mark\s?list|"
+    r"academic\s+record|detailed\s+marks?(?:\s+certificate)?|\bdmc\b)"
+)
+# Asking us to read it, or offering to send it. Both mean the same thing for
+# the next turn: stop interviewing and wait for the file.
+_WANTS_TRANSCRIPT_READ_RE: Final = re.compile(
+    r"(?:read|check|look\s+(?:at|through|over)|go\s+through|review|"
+    r"analys|analyz|scan|parse|extract|open)\w*\s+(?:\w+\s+){0,3}?"
+    + _TRANSCRIPT_NOUN
+    + r"|(?:upload|send|share|attach|provide|give\s+you|show\s+you)\w*\s+"
+    r"(?:\w+\s+){0,3}?" + _TRANSCRIPT_NOUN,
+    re.IGNORECASE,
+)
+
+
+def asks_to_share_transcript(message: str) -> bool:
+    """True when the student wants their transcript read but has not sent it.
+
+    Answering this by carrying on with the interview is the thing it prevents:
+    they have said what they want to do next, and asking for a name instead
+    reads as not having listened. The caller checks separately that no file
+    actually arrived this turn - once one has, it is parsed rather than
+    awaited.
+    """
+    return bool(_WANTS_TRANSCRIPT_READ_RE.search(message))
+
+
 def looks_like_noise(message: str) -> bool:
     """True when a message contains nothing that reads as a word.
 
@@ -656,6 +918,25 @@ def looks_like_noise(message: str) -> bool:
     if not tokens:
         return False
     return not any(_looks_like_word(t) for t in tokens)
+
+
+def extract_countries(text: str) -> list[str]:
+    """Every country named in a message, canonical and in the order written.
+
+    A student answering "where would you like to study" with "Australia, UK"
+    has named two destinations, not one. Taking the first and discarding the
+    rest silently is what this exists to stop - the discarded one is never
+    mentioned again, so the student has no way to notice it went missing.
+
+    Duplicates collapse ("UK and Britain" is one place), and the match is
+    anchored on the country table, so ordinary prose contributes nothing.
+    """
+    found: list[str] = []
+    for raw in _ANY_COUNTRY_RE.findall(text):
+        canonical = _COUNTRIES.get(raw.lower())
+        if canonical and canonical not in found:
+            found.append(canonical)
+    return found
 
 
 def _normalise_country_key(text: str) -> str:
@@ -707,6 +988,48 @@ def _lookup_country(text: str) -> str | None:
     return None
 
 
+def demonym_country(text: str) -> str | None:
+    """The country a nationality word refers to: "Indian" -> "India".
+
+    Separate from `_lookup_country` on purpose. A demonym is a claim about
+    citizenship and nothing else, so it answers the nationality slot outright -
+    where a bare country name could belong to either slot and has to be asked
+    about.
+    """
+    key = _normalise_country_key(text)
+    return _DEMONYMS.get(key) if key else None
+
+
+def states_nationality(message: str) -> str | None:
+    """The country claimed as citizenship by a nationality word in `message`.
+
+    "I am Indian" is unambiguous in a way "India" is not, so asking which slot
+    it belongs to is asking a question the student already answered.
+    """
+    # Two-word demonyms first ("new zealander", "sri lankan", "south african"),
+    # then single words. Scanning with one alternating pattern pairs words
+    # greedily - "a new" and then "zealander" - so the compound never forms.
+    words = re.findall(r"[a-z]+", message.lower())
+    for size in (2, 1):
+        for start in range(len(words) - size + 1):
+            found = demonym_country(" ".join(words[start : start + size]))
+            if found:
+                return found
+    return None
+
+
+# Words that answer "how many of them?" rather than naming a place. A lone
+# unlisted word is otherwise taken at face value as a country, so "from both"
+# was filed as a student whose nationality is "Both".
+_QUANTIFIERS: Final = frozenset(
+    {
+        "both", "all", "each", "every", "either", "any", "none", "neither",
+        "two", "three", "them", "those", "these", "one", "some",
+        "countries", "country", "places", "destinations", "options",
+    }
+)
+
+
 def _canonical_country(text: str) -> str | None:
     """A recognised country, else a single plausible word taken at face value."""
     known = _lookup_country(text)
@@ -720,6 +1043,7 @@ def _canonical_country(text: str) -> str | None:
         len(words) == 1
         and words[0].isalpha()
         and words[0] not in _NAME_STOPWORDS
+        and words[0] not in _QUANTIFIERS
         and _looks_like_word(words[0])
     ):
         return _title(words[0])
@@ -762,6 +1086,34 @@ def is_negation(message: str) -> bool:
     return bool(_NEGATIONS.match(message.strip()))
 
 
+# Answers to "all of them, or just one?" that mean all of them. Kept out of
+# `is_affirmation` deliberately: "both" is a yes to *this* question and
+# meaningless as a yes to any other - "both" in answer to "do you want to
+# change your grade?" settles nothing.
+#
+# "Either" and "any" are excluded on purpose. They read as "I do not mind
+# which", which is a different answer, and guessing between them is how a
+# destination gets dropped without the student noticing.
+_MEANS_EVERY_OPTION: Final = re.compile(
+    r"^\s*(?:yes[,\s]+)?(?:from\s+|in\s+|for\s+|search\s+|show\s+me\s+)?"
+    r"(?:both|all|the\s+two|every\s+one|each)"
+    r"(?:\s+of\s+(?:them|those|these))?(?:\s+of\s+course)?"
+    r"(?:\s+(?:countries|country|places|destinations|options))?"
+    r"[\s,.!]*(?:please|thanks|thank\s+you)?[\s,.!]*$",
+    re.IGNORECASE,
+)
+
+
+def means_every_option(message: str) -> bool:
+    """True when a reply picks every option offered, not one of them.
+
+    For "shall I search all of these, or just one?". A plain "both" is the
+    commonest answer to that and was being read as no answer at all, so the
+    destinations the student had just agreed to were quietly dropped.
+    """
+    return bool(_MEANS_EVERY_OPTION.match(message.strip()))
+
+
 def resolve_country_role(message: str) -> str | None:
     """Which slot the student means: 'nationality', 'target_country', or None.
 
@@ -792,6 +1144,11 @@ def bare_country(message: str) -> str | None:
     if not text or len(text.split()) > 3:
         return None
     if _NATIONALITY_RE.search(text) or _TARGET_RE.search(text):
+        return None
+    # A nationality word is not ambiguous either. "I am Indian" - and "Indian"
+    # on its own - state citizenship and nothing else, so asking which of the
+    # two country slots it belongs to asks what the student just answered.
+    if states_nationality(text):
         return None
     return _lookup_country(text)
 
@@ -901,15 +1258,79 @@ def _extract_name(text: str) -> str | None:
         return None
     if not all(_looks_like_word(w) for w in words):
         return None
+    # "I am Indian" is a citizenship, not an introduction. The same opener
+    # serves both, and _NAME_STOPWORDS covers "I am from Pakistan" but not the
+    # nationality word - so "Indian" was being stored as a student's name, over
+    # the top of the one read off their transcript.
+    if demonym_country(candidate) or _lookup_country(candidate):
+        return None
     return strip_name_filler(candidate)
 
 
+# Wanting a qualification versus holding one. Both sentences name a level, and
+# only the second one says anything about the student's history:
+#
+#     "I want to study business in masters"   -> a preference
+#     "I have done my masters in business"    -> a qualification
+#
+# A completion marker wins over a desire marker, because "I want to apply now
+# that I have finished my bachelors" is a statement of fact with an intention
+# wrapped around it.
+_INTENT_RE: Final = re.compile(
+    r"\b(want|wants|wanna|would like|hoping|hope|plan|plans|planning|"
+    r"aim|aiming|looking|interested|apply|applying|thinking|pursue|"
+    r"pursuing|go for|opt for|shortlist|show me|can you show)\b",
+    re.IGNORECASE,
+)
+_COMPLETION_RE: Final = re.compile(
+    r"\b(have done|has done|i did|did my|done my|completed|finished|"
+    r"graduated|holding|i hold|already have|passed|i am a|my degree)\b",
+    re.IGNORECASE,
+)
+
+
+def _states_intent(text: str) -> bool:
+    """True when a level is named as something wanted, not something held."""
+    if _COMPLETION_RE.search(text):
+        return False
+    return bool(_INTENT_RE.search(text))
+
+
 def _extract_level(text: str) -> EducationLevel | None:
-    """Read the qualification level out of free text, most specific first."""
+    """Read the qualification level out of free text, most specific first.
+
+    The canonical enum values are checked before the prose patterns, because
+    this function normalises the extraction model's output as well as a
+    student's typing. The model is told to answer with the schema's own
+    values, and `high_school` - the only one containing an underscore -
+    matched none of the prose patterns, so a *correct* model answer was being
+    turned into None. The other four survived only because their values happen
+    to be single words.
+    """
+    candidate = text.strip().lower().replace("-", "_").replace(" ", "_")
+    for level in EducationLevel:
+        if candidate == level.value:
+            return level
+
     for level, pattern in _LEVEL_RES:
         if pattern.search(text):
             return level
     return None
+
+
+def _is_level_only(text: str) -> bool:
+    """True when a phrase names a qualification level and nothing else.
+
+    "BS" and "bachelors" answer the level question, not the subject one, so
+    they must never be stored as a field of study. "BS computer science" is
+    not level-only - the subject survives the strip and is kept.
+    """
+    if _extract_level(text) is None:
+        return False
+    remainder = text
+    for _, pattern in _LEVEL_RES:
+        remainder = pattern.sub(" ", remainder)
+    return not re.sub(r"[^A-Za-z]", "", remainder)
 
 
 def _extract_field(text: str) -> str | None:
@@ -935,6 +1356,8 @@ def _extract_field(text: str) -> str | None:
 def _extract_score(text: str) -> AcademicScore | None:
     """Read a cumulative grade plus its scale out of free text."""
     match = _CGPA_RE.search(text)
+    if match is None:
+        match = _CGPA_TRAILING_RE.search(text)
     if match is None:
         match = _BARE_PERCENT_RE.search(text)
         if match is None:
@@ -1036,6 +1459,9 @@ def interpret_bare_answer(message: str, slot: SlotName) -> Any | None:
         # "India" answers a question about countries, not about a degree.
         if _lookup_country(text):
             return None
+        # "BS" answers the level question, not the subject one.
+        if _is_level_only(text):
+            return None
         if not re.fullmatch(r"[A-Za-z][A-Za-z &/.-]*", text):
             return None
         if not all(_looks_like_word(w) for w in text.split()):
@@ -1068,17 +1494,31 @@ def heuristic_extract(
 
     if (match := _NATIONALITY_RE.search(text)) is not None:
         patch.nationality = _canonical_country(_clean_phrase(match.group(1)))
+    elif (claimed := states_nationality(text)) is not None:
+        # "I am Indian" says the same thing as "I am from India", and says it
+        # about citizenship only - so it fills the slot outright rather than
+        # being held back as a country that could belong to either.
+        patch.nationality = claimed
 
     if (match := _TARGET_RE.search(text)) is not None:
         # The pattern only ever matches a known country, so this lookup is total.
         patch.target_country = _COUNTRIES[match.group(1).lower()]
 
+    # A bare degree token ("BS", "BFA") used to be filed as the field of study.
+    # It is a level, not a subject, and education_level now captures it - so it
+    # is deliberately no longer a fallback for the field.
     if (field := _extract_field(text)) is not None:
         patch.field_of_study = field
-    elif (match := _DEGREE_TOKENS.search(text)) is not None:
-        patch.field_of_study = match.group(1).upper()
 
-    patch.education_level = _extract_level(text)
+    # A level can be mentioned in two quite different senses, and reading one
+    # as the other is what put PhDs in front of a student asking for a
+    # Master's: "I want to study business in masters" says what they want to
+    # study next, not what they already hold.
+    if (level := _extract_level(text)) is not None:
+        if _states_intent(text):
+            patch.desired_level = level
+        else:
+            patch.education_level = level
 
     patch.cgpa = _extract_score(text)
 

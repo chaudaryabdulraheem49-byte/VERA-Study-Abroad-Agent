@@ -7,7 +7,9 @@ const Card = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElemen
     <div
       ref={ref}
       className={cn(
-        "rounded-xl border border-border bg-card text-card-foreground shadow-sm",
+        // 16px for content cards. Depth is colour contrast against the cream
+        // canvas, never a shadow - the system has no elevation tiers.
+        "rounded-[16px] border border-border bg-card text-card-foreground",
         className,
       )}
       {...props}

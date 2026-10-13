@@ -8,3 +8,14 @@ openai>=1.51.0
 pypdfium2>=4.30.0
 pillow>=10.4.0
 redis>=5.1.0
+
+# --- Phase 2: crawl, ingest, hybrid search ---------------------------------
+crawl4ai>=0.4.0          # needs: python -m playwright install chromium
+qdrant-client>=1.12.0
+sqlalchemy[asyncio]>=2.0.35
+asyncpg>=0.29.0
+pandas>=2.2.0            # bulk register imports only (scripts/ingest_cricos.py)
+
+# --- Accounts: Supabase JWT verification + chat history --------------------
+pyjwt[crypto]>=2.9.0
+python-jose[cryptography]>=3.3.0

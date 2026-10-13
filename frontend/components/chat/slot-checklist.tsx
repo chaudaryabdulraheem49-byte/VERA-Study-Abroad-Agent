@@ -33,14 +33,14 @@ export function SlotChecklist({
   return (
     <aside
       className={cn(
-        "flex-col gap-4 rounded-xl border border-border bg-card p-4",
+        "flex-col gap-5 rounded-[12px] border border-border bg-card p-5",
         className,
       )}
       aria-label="Onboarding progress"
     >
       <div>
         <div className="flex items-center justify-between gap-2">
-          <h2 className="text-sm font-semibold">Your profile</h2>
+          <h2 className="caption-upper text-muted-foreground">Your profile</h2>
           <span className="text-xs tabular-nums text-muted-foreground">
             {filledCount}/{SLOT_ORDER.length}
           </span>
@@ -48,7 +48,7 @@ export function SlotChecklist({
         <Progress
           value={percent}
           className="mt-2"
-          indicatorClassName={unlocked ? "bg-emerald-500" : undefined}
+          indicatorClassName={unlocked ? "bg-success" : undefined}
           aria-label="Onboarding completion"
         />
       </div>
@@ -65,9 +65,9 @@ export function SlotChecklist({
                 className={cn(
                   "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full",
                   needsConfirmation
-                    ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400"
+                    ? "bg-ochre text-on-fill"
                     : isFilled
-                      ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400"
+                      ? "bg-mint text-on-fill"
                       : "text-muted-foreground",
                 )}
                 aria-hidden
@@ -81,18 +81,18 @@ export function SlotChecklist({
                 )}
               </span>
               <span className="min-w-0">
-                <span className="block text-muted-foreground">{SLOT_LABELS[slot]}</span>
+                <span className="caption-upper block text-muted-foreground">{SLOT_LABELS[slot]}</span>
                 <span
                   className={cn(
                     "block truncate font-medium",
-                    isFilled ? "text-foreground" : "text-muted-foreground/60",
+                    isFilled ? "font-medium text-ink" : "text-muted-foreground/70",
                   )}
                   title={value ?? undefined}
                 >
                   {value ?? "Not provided yet"}
                 </span>
                 {needsConfirmation ? (
-                  <span className="text-amber-600 dark:text-amber-400">
+                  <span className="text-ink">
                     From your transcript - please confirm
                   </span>
                 ) : null}
@@ -104,10 +104,10 @@ export function SlotChecklist({
 
       <div
         className={cn(
-          "mt-auto flex items-start gap-2 rounded-lg p-2.5 text-xs",
+          "mt-auto flex items-start gap-2 rounded-[8px] border p-3 text-xs",
           unlocked
-            ? "bg-emerald-50 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300"
-            : "bg-muted text-muted-foreground",
+            ? "border-transparent bg-mint text-on-fill"
+            : "border-border bg-surface-soft text-muted-foreground",
         )}
       >
         {unlocked ? (

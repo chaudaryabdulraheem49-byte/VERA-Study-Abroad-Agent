@@ -31,7 +31,16 @@ export async function POST(request: NextRequest): Promise<Response> {
 
     const upstream = await fetch(`${BACKEND_URL}/api/chat/stream`, {
       method: "POST",
-      headers: { "content-type": contentType, accept: "text/event-stream" },
+      headers: {
+        "content-type": contentType,
+        accept: "text/event-stream",
+        // Forwarded untouched: the backend verifies the Supabase JWT itself.
+        // Re-deriving the user here would mean two places deciding who
+        // someone is, which is one too many.
+        ...(request.headers.get("authorization")
+          ? { authorization: request.headers.get("authorization")! }
+          : {}),
+      },
       body,
       signal: controller.signal,
       cache: "no-store",

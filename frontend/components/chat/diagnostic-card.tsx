@@ -53,7 +53,7 @@ function buildMetrics(conversion: GradeConversion): Metric[] {
       scaleHint: "out of 4.00",
       // 3.0 is the common graduate-admission floor.
       markers: [75],
-      tone: "bg-sky-500",
+      tone: "bg-violet",
     },
     {
       key: "de",
@@ -66,7 +66,7 @@ function buildMetrics(conversion: GradeConversion): Metric[] {
       scaleHint: "1.0 best - 5.0 fail",
       // 2.5 is the usual competitive Master's cut-off.
       markers: [62.5],
-      tone: "bg-amber-500",
+      tone: "bg-amber",
     },
     {
       key: "uk",
@@ -77,7 +77,7 @@ function buildMetrics(conversion: GradeConversion): Metric[] {
       percent: conversion.normalized_percentage,
       scaleHint: "2:2 50 - 2:1 60 - 1st 70",
       markers: [50, 60, 70],
-      tone: "bg-violet-500",
+      tone: "bg-cyan",
     },
   ];
 }
@@ -99,7 +99,7 @@ export function DiagnosticCard({ payload, className }: DiagnosticCardProps) {
       <CardHeader className="gap-2 border-b border-border bg-muted/40">
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div>
-            <CardTitle className="text-base">
+            <CardTitle className="display-sm text-ink">
               Academic diagnostic{payload.student_name ? ` - ${payload.student_name}` : ""}
             </CardTitle>
             <CardDescription>
@@ -122,14 +122,14 @@ export function DiagnosticCard({ payload, className }: DiagnosticCardProps) {
           {metrics.map((metric) => (
             <div
               key={metric.key}
-              className="rounded-lg border border-border bg-background p-3"
+              className="rounded-[8px] border border-border bg-surface-soft p-4"
             >
-              <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              <div className="caption-upper flex items-center gap-1.5 text-muted-foreground">
                 {metric.icon}
                 {metric.system}
               </div>
               <div className="mt-2 flex items-baseline gap-1.5">
-                <span className="text-2xl font-semibold tabular-nums">{metric.value}</span>
+                <span className="text-[26px] leading-[1.25] tabular-nums text-ink">{metric.value}</span>
                 <span className="text-xs text-muted-foreground">{metric.scaleHint}</span>
               </div>
               <Progress
@@ -144,7 +144,7 @@ export function DiagnosticCard({ payload, className }: DiagnosticCardProps) {
           ))}
         </div>
 
-        <dl className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-lg bg-muted/50 p-3 text-xs sm:grid-cols-4">
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-[8px] border border-border bg-surface-soft p-4 text-xs sm:grid-cols-4">
           <Stat label="Normalised" value={`${conversion.normalized_percentage.toFixed(1)}%`} />
           <Stat
             label="Reported"
@@ -153,7 +153,7 @@ export function DiagnosticCard({ payload, className }: DiagnosticCardProps) {
           <Stat
             label="Backlogs"
             value={String(payload.backlogs)}
-            tone={payload.backlogs > 0 ? "text-amber-600 dark:text-amber-400" : undefined}
+            tone={payload.backlogs > 0 ? "text-ink" : undefined}
           />
           <Stat
             label="Subjects"
@@ -175,7 +175,7 @@ export function DiagnosticCard({ payload, className }: DiagnosticCardProps) {
           </ul>
         ) : null}
 
-        <details className="group rounded-lg border border-border p-3 text-xs">
+        <details className="group rounded-[8px] border border-border bg-surface-soft p-4 text-xs">
           <summary className="cursor-pointer select-none font-medium text-muted-foreground transition-colors hover:text-foreground">
             How this was calculated
           </summary>
@@ -186,7 +186,7 @@ export function DiagnosticCard({ payload, className }: DiagnosticCardProps) {
               </span>{" "}
               - V = 1 + 3 x ((Nmax - Nd) / (Nmax - Nmin))
             </p>
-            <code className="block rounded bg-muted px-2 py-1.5 font-mono text-[11px] text-foreground">
+            <code className="block rounded bg-muted px-2 py-1.5 text-[11px] text-foreground">
               {conversion.german_formula}
             </code>
             {conversion.assumptions.length > 0 ? (
@@ -218,7 +218,7 @@ function Stat({
   return (
     <div>
       <dt className="text-muted-foreground">{label}</dt>
-      <dd className={cn("font-semibold tabular-nums", tone)}>{value}</dd>
+      <dd className={cn("text-[15px] tabular-nums text-ink", tone)}>{value}</dd>
     </div>
   );
 }

@@ -1,0 +1,43 @@
+# Backend is not containerised here on purpose - it runs from the venv with
+# reload so edits land immediately. If you want to compare throughput under
+# concurrency, start a second copy with workers on another port and point
+# BACKEND_URL at it:
+#
+#     uvicorn app.main:app --workers 4 --port 8001
+#
+# Note that --workers and --reload are mutually exclusive, and each worker is a
+# separate process with its own session store: the in-memory store will not
+# share sessions across them, so use it for measurement, not for daily work.
+# Phase 2 infrastructure: Postgres for the hard filter, Qdrant for vectors.
+#   docker compose up -d
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: study_abroad
+    ports:
+      # 5433 on the host: a native PostgreSQL service commonly already owns
+      # 5432, and both binding it means connections silently reach whichever
+      # won the race - which looks like a password failure, not a conflict.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d study_abroad"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"   # REST
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrantdata:/qdrant/storage
+
+volumes:
+  pgdata:
+  qdrantdata:

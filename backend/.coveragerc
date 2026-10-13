@@ -1,0 +1,20 @@
+[run]
+source = app
+branch = True
+omit =
+    # Entry points: argument parsing and process wiring, exercised by running
+    # the app rather than by unit tests.
+    app/services/phase2/pipeline.py
+    */__init__.py
+
+[report]
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    if __name__ == .__main__.:
+
+[html]
+directory = htmlcov

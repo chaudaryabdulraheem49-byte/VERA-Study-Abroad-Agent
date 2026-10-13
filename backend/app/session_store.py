@@ -54,6 +54,7 @@ class InMemorySessionStore(SessionStore):
         self._ttl = ttl_seconds
         self._data: dict[str, tuple[float, SessionState]] = {}
         self._lock = asyncio.Lock()
+        self._last_eviction = 0.0
 
     async def get(self, session_id: str) -> SessionState | None:
         async with self._lock:
@@ -64,17 +65,18 @@ class InMemorySessionStore(SessionStore):
             if expires_at <= time.time():
                 self._data.pop(session_id, None)
                 return None
-            # Return a copy so a failed request cannot leave the stored state
-            # half-mutated; the caller writes back explicitly via `save`.
-            return state.model_copy(deep=True)
+        # Copy outside the lock to minimize lock hold duration and eliminate
+        # cross-request contention during deep serialization.
+        return state.model_copy(deep=True)
 
     async def save(self, state: SessionState) -> None:
+        # Pre-copy state outside the lock: model serialization is CPU-bound
+        # and should not stall other concurrent coroutines.
+        copied = state.model_copy(deep=True)
+        expires_at = time.time() + self._ttl
         async with self._lock:
             self._evict_expired()
-            self._data[state.session_id] = (
-                time.time() + self._ttl,
-                state.model_copy(deep=True),
-            )
+            self._data[state.session_id] = (expires_at, copied)
 
     async def delete(self, session_id: str) -> None:
         async with self._lock:
@@ -82,6 +84,12 @@ class InMemorySessionStore(SessionStore):
 
     def _evict_expired(self) -> None:
         now = time.time()
+        # Throttle full sweeps to at most once per minute rather than iterating
+        # the entire dictionary on every write; individual keys are already
+        # evicted lazily on access in get().
+        if now - self._last_eviction < 60.0:
+            return
+        self._last_eviction = now
         for key in [k for k, (exp, _) in self._data.items() if exp <= now]:
             self._data.pop(key, None)
 
@@ -90,9 +98,21 @@ class RedisSessionStore(SessionStore):
     """Redis-backed store; state is serialised as JSON with a rolling TTL."""
 
     def __init__(self, url: str, ttl_seconds: int) -> None:
-        from redis.asyncio import Redis  # imported lazily: optional dependency
+        from redis.asyncio import ConnectionPool, Redis  # imported lazily: optional dependency
 
-        self._redis = Redis.from_url(url, decode_responses=True)
+        # Configure an explicit connection pool with health checks and aggressive
+        # timeouts so dropped connections or network blips fail fast instead of
+        # blocking async event loops.
+        pool = ConnectionPool.from_url(
+            url,
+            decode_responses=True,
+            max_connections=50,
+            socket_timeout=3.0,
+            socket_connect_timeout=2.0,
+            socket_keepalive=True,
+            health_check_interval=30,
+        )
+        self._redis = Redis(connection_pool=pool)
         self._ttl = ttl_seconds
 
     async def get(self, session_id: str) -> SessionState | None:
