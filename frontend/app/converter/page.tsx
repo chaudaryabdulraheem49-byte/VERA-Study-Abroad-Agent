@@ -85,14 +85,21 @@ export default function ConverterPage() {
         <SideDock />
 
         <div className="min-w-0 flex-1 space-y-4">
-          <header className="glass relative z-20 flex items-center gap-3 rounded-[18px] px-4 py-3">
-            <Link href="/chat" className="display-sm text-ink">
-              Vera
+          <header className="app-topbar">
+            <Link className="brand" href="/" aria-label="Orbitly home">
+              <span className="brand-mark" aria-hidden="true">
+                <span></span>
+                <span></span>
+                <span></span>
+              </span>
+              <span className="brand-name">ORBITLY</span>
             </Link>
-            <span aria-hidden className="h-4 w-px bg-hairline" />
-            <p className="caption-upper text-muted-ink">Grade converter</p>
+            <span className="app-separator"></span>
+            <span className="app-context">
+              <i></i> GRADE CONVERTER
+            </span>
             <div className="ml-auto">
-              <ThemeToggle />
+              <ThemeToggle showLabel={false} />
             </div>
           </header>
 

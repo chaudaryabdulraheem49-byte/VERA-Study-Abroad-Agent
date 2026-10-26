@@ -3,7 +3,7 @@ import { Suspense } from "react";
 import { AuthForm } from "@/components/auth/auth-form";
 
 export const metadata = {
-  title: "Sign in - Vera",
+  title: "Log in — Orbitly",
 };
 
 export default function Page() {

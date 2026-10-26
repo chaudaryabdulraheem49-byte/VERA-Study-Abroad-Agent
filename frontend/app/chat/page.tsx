@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { HelpCircle } from "lucide-react";
 
 import { UserButton } from "@/components/auth/user-button";
 import { ChatWindow } from "@/components/chat/chat-window";
@@ -11,67 +10,114 @@ import { SideDock } from "@/components/side-dock";
 import { ThemeToggle } from "@/components/theme-toggle";
 
 export default function ChatPage() {
-  // Lifted here because the sidebar (which thread is highlighted) and the chat
-  // window (which thread to load) both need it.
   const [activeThreadId, setActiveThreadId] = React.useState<string | null>(null);
-  // History is a panel rather than a permanent column: on a laptop the
-  // conversation is the point, and a list that is always open costs it width.
   const [historyOpen, setHistoryOpen] = React.useState(false);
 
   return (
-    <main className="relative flex h-dvh flex-col overflow-hidden">
-      <div aria-hidden className="aurora" />
-
-      <div className="relative z-10 mx-auto flex h-full w-full max-w-[1400px] gap-3 p-3 sm:gap-4 sm:p-4">
+    <div className="app-page h-dvh max-h-dvh overflow-hidden">
+      <div className="chat-shell h-full max-h-full overflow-hidden">
         <SideDock
           onToggleHistory={() => setHistoryOpen((open) => !open)}
           historyOpen={historyOpen}
         />
 
-        <div className="flex min-w-0 flex-1 flex-col gap-3 sm:gap-4">
-          {/* Top bar: title, transcript status, help. */}
-          <header className="glass relative z-20 flex shrink-0 items-center gap-3 rounded-[18px] px-4 py-3">
-            <Link href="/" className="display-sm text-ink">
-              Vera
+        <div className="chat-workspace h-full max-h-full overflow-hidden">
+          <header className="app-topbar shrink-0">
+            <Link className="brand" href="/" aria-label="Orbitly home">
+              <span className="brand-mark" aria-hidden="true">
+                <span></span>
+                <span></span>
+                <span></span>
+              </span>
+              <span className="brand-name">ORBITLY</span>
             </Link>
-            <span aria-hidden className="h-4 w-px bg-hairline" />
-            <p className="caption-upper hidden text-muted-ink sm:block">
-              Study abroad advisor
-            </p>
+            <span className="app-separator"></span>
+            <span className="app-context">
+              <i></i> ADVISOR WORKSPACE
+            </span>
 
-            <div className="ml-auto flex items-center gap-2">
-              <Link
-                href="/"
-                aria-label="What Vera does"
-                className="flex h-9 w-9 items-center justify-center rounded-[12px] text-muted-ink transition-colors hover:bg-white/5 hover:text-ink"
+            <div className="app-actions">
+              <button
+                type="button"
+                onClick={() => setHistoryOpen((open) => !open)}
+                className={`theme-toggle cursor-pointer font-display text-[10px] flex items-center gap-1.5 px-3 py-1.5 ${
+                  historyOpen
+                    ? "!border-[var(--accent)] !text-[var(--accent)] bg-[var(--accent)]/10"
+                    : ""
+                }`}
+                aria-label="Toggle chat history"
+                title="View past conversations"
               >
-                <HelpCircle className="h-4 w-4" aria-hidden />
+                <span className="theme-toggle-icon">↶</span>
+                <span>History</span>
+              </button>
+
+              <Link
+                className="app-help"
+                href="/#how-it-works"
+                aria-label="How Orbitly works"
+                title="How Orbitly works"
+              >
+                ?
               </Link>
-              <ThemeToggle />
+              <ThemeToggle showLabel={false} />
               <UserButton />
             </div>
           </header>
 
-          <div className="relative z-0 flex min-h-0 flex-1 gap-3 sm:gap-4">
-            {historyOpen ? (
-              <SidebarHistory
-                className="hidden w-64 shrink-0 overflow-y-auto md:flex"
-                activeThreadId={activeThreadId}
-                onOpen={(id) => {
-                  setActiveThreadId(id);
-                  setHistoryOpen(false);
-                }}
-              />
-            ) : null}
+          <div className="relative z-0 flex min-h-0 flex-1 gap-3 sm:gap-4 overflow-hidden h-full">
+            {historyOpen && (
+              <>
+                {/* Desktop sidebar */}
+                <SidebarHistory
+                  className="hidden w-72 shrink-0 overflow-y-auto md:flex h-full"
+                  activeThreadId={activeThreadId}
+                  onOpen={(id) => {
+                    setActiveThreadId(id);
+                  }}
+                  onNewChat={() => {
+                    setActiveThreadId(null);
+                  }}
+                  onClose={() => setHistoryOpen(false)}
+                />
+
+                {/* Mobile / tablet drawer overlay */}
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 md:hidden"
+                  onClick={() => setHistoryOpen(false)}
+                >
+                  <div
+                    className="w-full max-w-sm"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <SidebarHistory
+                      className="w-full max-h-[85vh] overflow-y-auto shadow-2xl"
+                      activeThreadId={activeThreadId}
+                      onOpen={(id) => {
+                        setActiveThreadId(id);
+                        setHistoryOpen(false);
+                      }}
+                      onNewChat={() => {
+                        setActiveThreadId(null);
+                        setHistoryOpen(false);
+                      }}
+                      onClose={() => setHistoryOpen(false)}
+                    />
+                  </div>
+                </div>
+              </>
+            )}
 
             <ChatWindow
-              className="min-h-0 flex-1"
+              className="min-h-0 flex-1 h-full overflow-hidden"
               threadId={activeThreadId}
               onThreadChange={setActiveThreadId}
+              onToggleHistory={() => setHistoryOpen((open) => !open)}
+              historyOpen={historyOpen}
             />
           </div>
         </div>
       </div>
-    </main>
+    </div>
   );
 }

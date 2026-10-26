@@ -102,6 +102,17 @@ def test_degree_plus_subject_keeps_both() -> None:
     assert patch.education_level is EducationLevel.BACHELORS
 
 
+def test_ba_in_english_literature_extracts_field_and_level_without_nationality() -> None:
+    patch = heuristic_extract("I did a BA in English Literature", SessionState())
+    assert patch.field_of_study == "English Literature"
+    assert patch.education_level is EducationLevel.BACHELORS
+    assert patch.nationality is None
+    norm = _normalise_patch(patch)
+    assert norm.field_of_study == "English Literature"
+    assert norm.nationality is None
+
+
+
 def test_degree_word_is_not_sliced_into_a_field() -> None:
     """Reported: "bachelors" became the field "chelors"."""
     for text in ("bachelors", "bachelor's", "masters", "BS", "MSc"):
@@ -723,3 +734,31 @@ def test_a_phrase_naming_one_country_resolves_to_it(
 def test_one_destination_does_not_trigger_the_question() -> None:
     patch = SlotPatch(target_country="Germany")
     assert _destinations_named("", SessionState(), patch) == []
+
+
+def test_origin_is_nationality_not_destination_or_field() -> None:
+    text = "hey this is ahmad from pakistan I have compeleted inter in medical subjects with 85 percent marks"
+    patch = heuristic_extract(text, SessionState())
+    assert patch.full_name == "Ahmad"
+    assert patch.nationality == "Pakistan"
+    assert patch.target_country is None
+    assert patch.field_of_study == "Medicine"
+    assert patch.education_level == EducationLevel.HIGH_SCHOOL
+    assert patch.cgpa is not None
+    assert patch.cgpa.raw_value == 85.0
+
+
+def test_clarifying_origin_never_becomes_field_of_study() -> None:
+    text = "i am from pakistan"
+    patch = heuristic_extract(text, SessionState())
+    assert patch.nationality == "Pakistan"
+    assert patch.target_country is None
+    assert patch.field_of_study is None
+    assert interpret_bare_answer(text, SlotName.FIELD_OF_STUDY) is None
+
+
+def test_same_nationality_and_target_in_one_patch_drops_target() -> None:
+    patch = SlotPatch(nationality="Pakistan", target_country="Pakistan")
+    normalised = _normalise_patch(patch)
+    assert normalised.nationality == "Pakistan"
+    assert normalised.target_country is None

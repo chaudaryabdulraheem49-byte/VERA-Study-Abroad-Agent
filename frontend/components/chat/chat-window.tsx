@@ -79,12 +79,16 @@ interface ChatWindowProps {
   threadId?: string | null;
   /** Fired when the backend starts (or resumes) saving to a thread. */
   onThreadChange?: (threadId: string | null) => void;
+  onToggleHistory?: () => void;
+  historyOpen?: boolean;
 }
 
 export function ChatWindow({
   className,
   threadId,
   onThreadChange,
+  onToggleHistory,
+  historyOpen,
 }: ChatWindowProps) {
   const [messages, setMessages] = React.useState<ChatMessage[]>([WELCOME]);
   const [input, setInput] = React.useState("");
@@ -467,7 +471,7 @@ export function ChatWindow({
 
   return (
     <div
-      className={cn("relative flex h-full min-h-0 gap-4", className)}
+      className={cn("relative flex h-full min-h-0 gap-4 overflow-hidden", className)}
       onDragEnter={(event) => {
         if (!event.dataTransfer.types.includes("Files")) return;
         dragDepth.current += 1;
@@ -480,36 +484,50 @@ export function ChatWindow({
       }}
       onDrop={onDrop}
     >
-      <div className="glass flex min-w-0 flex-1 flex-col overflow-hidden rounded-[18px]">
-        <header className="flex items-center gap-3 border-b border-hairline px-5 py-4">
-          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-cyan text-primary-foreground">
-            <Bot className="h-4 w-4" aria-hidden />
-          </span>
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-[16px] font-semibold leading-[1.4] text-ink">
-              Vera - Study Abroad Advisor
-            </p>
-            <p className="caption-upper text-muted-foreground">
-              {unlocked
-                ? "Diagnostics unlocked"
-                : `${SLOT_ORDER.length - missing.length} of ${SLOT_ORDER.length} details collected`}
-            </p>
+      <div className="conversation-panel flex min-w-0 flex-1 flex-col overflow-hidden h-full">
+        <header className="chat-header">
+          <div className="advisor-identity">
+            <span className="advisor-orb">✦</span>
+            <div>
+              <h1 id="chat-title">
+                Vera <span>— Study Abroad Advisor</span>
+              </h1>
+              <p>
+                <span className="status-pip"></span>
+                {unlocked
+                  ? "DIAGNOSTICS UNLOCKED"
+                  : `${SLOT_ORDER.length - missing.length} OF ${SLOT_ORDER.length} DETAILS COLLECTED`}
+              </p>
+            </div>
           </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={() => void startNewConversation()}
-            disabled={isStreaming}
-            title="Clear this conversation and start fresh"
-          >
-            <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-            New chat
-          </Button>
+          <div className="flex items-center gap-3">
+            {onToggleHistory && (
+              <button
+                type="button"
+                className={cn(
+                  "new-chat flex items-center gap-1.5 transition-colors",
+                  historyOpen && "!text-[var(--accent)] font-medium",
+                )}
+                onClick={onToggleHistory}
+                title="View your saved conversations"
+              >
+                <span>↶</span> Chat History
+              </button>
+            )}
+            <button
+              type="button"
+              className="new-chat"
+              onClick={() => void startNewConversation()}
+              disabled={isStreaming}
+              title="Clear this conversation and start fresh"
+            >
+              ↻ &nbsp; New chat
+            </button>
+          </div>
         </header>
 
         {isRestored ? (
-          <p className="border-b border-border bg-muted/40 px-4 py-2 text-xs text-muted-foreground">
+          <p className="border-b border-line bg-muted/40 px-4 py-2 font-display text-[10px] text-muted">
             Continuing your earlier conversation. Choose &ldquo;New chat&rdquo; to start over.
           </p>
         ) : null}
@@ -523,33 +541,35 @@ export function ChatWindow({
               greeting - once a student has said anything, the transcript is
               the thing worth the space. */}
           {messages.length <= 1 && !isStreaming ? (
-            <div className="relative flex min-h-full flex-col items-center justify-center px-4 py-10 text-center">
-              <div aria-hidden className="light-cone" />
-              <h2 className="display-lg rise-in relative text-ink">Where shall we begin?</h2>
-              <p
-                className="rise-in relative mt-4 max-w-md text-[15px] leading-[1.65] text-muted-ink"
-                style={{ ["--rise-delay" as string]: "90ms" }}
-              >
-                Tell me where you studied and what you are aiming for, or drop
-                your transcript in and I will read it.
-              </p>
-              <div
-                className="rise-in relative mt-7 flex flex-wrap justify-center gap-2"
-                style={{ ["--rise-delay" as string]: "180ms" }}
-              >
-                {OPENERS.map((opener) => (
-                  <button
-                    key={opener}
-                    type="button"
-                    onClick={() => {
-                      setInput(opener);
-                      textareaRef.current?.focus();
-                    }}
-                    className="glass cursor-pointer rounded-full px-3.5 py-2 text-[13px] text-muted-ink transition-colors hover:text-ink"
-                  >
-                    {opener}
-                  </button>
-                ))}
+            <div className="conversation-body flex-1">
+              <div className="conversation-hero">
+                <span className="conversation-kicker">ORBITLY / CONVERSATION 001</span>
+                <h2>Where shall we begin?</h2>
+                <p>
+                  Tell me where you studied and what you are aiming for, or drop
+                  your transcript in and I will read it.
+                </p>
+                <div className="suggestion-grid">
+                  {OPENERS.map((opener) => (
+                    <button
+                      key={opener}
+                      type="button"
+                      onClick={() => {
+                        setInput(opener);
+                        textareaRef.current?.focus();
+                      }}
+                      className="suggestion-chip"
+                    >
+                      {opener}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="conversation-note">
+                <span className="note-pulse"></span>
+                <span>
+                  Vera asks one useful question at a time. Your profile takes shape as you talk.
+                </span>
               </div>
             </div>
           ) : (
@@ -561,20 +581,19 @@ export function ChatWindow({
           {status ? <ThinkingIndicator status={status} stage={stage} /> : null}
         </div>
 
-        <div className="border-t border-hairline p-3">
-          {/* Attached-transcript pill. Emerald, because in this palette
-              emerald is the "we have this, it is confirmed" colour. */}
+        <div className="p-2 sm:p-3">
+          {/* Attached-transcript pill */}
           {attachment ? (
-            <div className="mb-2 flex items-center gap-2 rounded-full border border-emerald/30 bg-emerald/10 px-3 py-1.5 text-xs text-ink">
-              <FileText className="h-3.5 w-3.5 shrink-0 text-emerald" aria-hidden />
+            <div className="mx-4 mb-2 flex items-center gap-2 rounded-full border border-signal/30 bg-signal/10 px-3 py-1.5 text-xs text-ink">
+              <FileText className="h-3.5 w-3.5 shrink-0 text-signal" aria-hidden />
               <span className="truncate font-medium">{attachment.name}</span>
-              <span className="metric shrink-0 text-muted-ink">
+              <span className="shrink-0 text-muted font-display text-[10px]">
                 {(attachment.size / 1024).toFixed(0)} KB
               </span>
               <button
                 type="button"
                 onClick={() => setAttachment(null)}
-                className="ml-auto cursor-pointer rounded-full p-0.5 text-muted-ink transition-colors hover:text-ink"
+                className="ml-auto cursor-pointer rounded-full p-0.5 text-muted hover:text-ink"
                 aria-label="Remove attachment"
               >
                 <X className="h-3.5 w-3.5" aria-hidden />
@@ -583,13 +602,19 @@ export function ChatWindow({
           ) : null}
 
           {attachmentError ? (
-            <p className="mb-2 flex items-center gap-1.5 text-xs text-destructive">
+            <p className="mx-4 mb-2 flex items-center gap-1.5 text-xs text-destructive">
               <TriangleAlert className="h-3.5 w-3.5" aria-hidden />
               {attachmentError}
             </p>
           ) : null}
 
-          <div className="flex items-end gap-2">
+          <form
+            className="composer"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (canSend) void send();
+            }}
+          >
             <input
               ref={fileInputRef}
               type="file"
@@ -600,16 +625,16 @@ export function ChatWindow({
                 event.target.value = "";
               }}
             />
-            <Button
+            <button
               type="button"
-              variant="ghost"
-              size="icon"
+              className="attach-button"
               onClick={() => fileInputRef.current?.click()}
               disabled={isStreaming}
               aria-label="Attach transcript"
+              title="Attach transcript"
             >
-              <Paperclip className="h-4 w-4" aria-hidden />
-            </Button>
+              ⌕
+            </button>
 
             <textarea
               ref={textareaRef}
@@ -625,31 +650,31 @@ export function ChatWindow({
               rows={1}
               maxLength={4000}
               placeholder="Tell me about yourself, or drop your transcript here..."
-              className="max-h-40 min-h-[44px] flex-1 resize-none rounded-[12px] border border-border bg-card px-4 py-3 text-[16px] leading-[1.5] text-ink outline-none transition-colors placeholder:text-faint focus:border-cyan"
+              className="max-h-40 min-h-[38px] flex-1 resize-none bg-transparent px-2 py-2 text-[14px] text-ink outline-none placeholder:text-muted"
             />
 
             {isStreaming ? (
-              <Button
+              <button
                 type="button"
-                variant="outline"
-                size="icon"
+                className="send-button"
                 onClick={() => abortRef.current?.abort()}
                 aria-label="Stop generating"
+                title="Stop generating"
               >
                 <Square className="h-3.5 w-3.5" aria-hidden />
-              </Button>
+              </button>
             ) : (
-              <Button
-                type="button"
-                size="icon"
-                onClick={() => void send()}
+              <button
+                type="submit"
+                className="send-button"
                 disabled={!canSend}
                 aria-label="Send message"
+                title="Send message"
               >
-                <ArrowUp className="h-4 w-4" aria-hidden />
-              </Button>
+                ↑
+              </button>
             )}
-          </div>
+          </form>
         </div>
       </div>
 
@@ -658,7 +683,7 @@ export function ChatWindow({
         missing={missing}
         pendingConfirmation={pendingConfirmation}
         unlocked={unlocked}
-        className="hidden w-64 shrink-0 lg:flex"
+        className="hidden w-64 shrink-0 lg:flex sticky top-0 self-start h-full"
       />
 
       {isDragging ? (
@@ -704,13 +729,13 @@ function ThinkingIndicator({
         {[0, 1, 2].map((i) => (
           <span
             key={i}
-            className="wave-dot h-1.5 w-1.5 rounded-full bg-cyan"
+            className="wave-dot h-1.5 w-1.5 rounded-full bg-accent"
             style={{ animationDelay: `${i * 160}ms` }}
           />
         ))}
       </span>
 
-      <span className="text-xs text-muted-ink">{status}</span>
+      <span className="text-xs text-ink font-medium">{status}</span>
 
       {active >= 0 ? (
         <span aria-hidden className="ml-1 flex items-center gap-1">
@@ -794,7 +819,7 @@ function MessageActions({ content }: { content: string }) {
             // happen.
           }
         }}
-        className="flex cursor-pointer items-center gap-1.5 rounded-[8px] px-2 py-1 text-xs text-faint transition-colors hover:text-ink"
+        className="flex cursor-pointer items-center gap-1.5 rounded-[8px] px-2 py-1 text-xs text-muted transition-colors hover:text-ink"
       >
         {copied ? (
           <Check className="h-3.5 w-3.5 text-emerald" aria-hidden />
@@ -806,7 +831,7 @@ function MessageActions({ content }: { content: string }) {
 
       <Link
         href="/discovery"
-        className="flex items-center gap-1.5 rounded-[8px] px-2 py-1 text-xs text-faint transition-colors hover:text-ink"
+        className="flex items-center gap-1.5 rounded-[8px] px-2 py-1 text-xs text-muted transition-colors hover:text-ink"
       >
         <Compass className="h-3.5 w-3.5" aria-hidden />
         Browse catalogue
@@ -823,11 +848,10 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       {message.content || message.pending ? (
         <div
           className={cn(
-            "max-w-[85%] whitespace-pre-wrap rounded-[14px] px-4 py-3 text-[15px] leading-[1.6]",
+            "max-w-[85%] whitespace-pre-wrap rounded-[14px] px-4 py-3 text-[14px] leading-[1.6]",
             isUser
-              // The student's own words carry the accent; Vera speaks on glass.
-              ? "rounded-br-[4px] bg-cyan/15 text-ink ring-1 ring-cyan/25"
-              : "glass rounded-bl-[4px] text-ink",
+              ? "rounded-br-[4px] bg-accent text-[#140d0a] font-medium"
+              : "chat-bubble-assistant rounded-bl-[4px] shadow-sm",
           )}
         >
           {/* Nothing has arrived yet: show the shape of a reply rather than an

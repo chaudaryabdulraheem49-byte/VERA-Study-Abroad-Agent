@@ -1,7 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, MessageSquare, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { Loader2, MessageSquare, Trash2, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { authHeader, isAuthConfigured } from "@/lib/auth-headers";
@@ -13,7 +14,6 @@ export interface ChatThread {
   updated_at: string;
 }
 
-/** "Today", "Yesterday", then a date - which is how people look for a conversation. */
 function when(iso: string): string {
   const then = new Date(iso);
   if (Number.isNaN(then.getTime())) return "";
@@ -28,24 +28,22 @@ function when(iso: string): string {
 interface SidebarHistoryProps {
   activeThreadId?: string | null;
   onOpen?: (threadId: string) => void;
+  onNewChat?: () => void;
+  onClose?: () => void;
   className?: string;
 }
 
-/**
- * The signed-in student's saved conversations.
- *
- * Renders nothing at all when accounts are not configured or nobody is signed
- * in: an empty panel headed "Your conversations" implies the feature is broken
- * rather than absent.
- */
 export function SidebarHistory({
   activeThreadId,
   onOpen,
+  onNewChat,
+  onClose,
   className,
 }: SidebarHistoryProps) {
   const [mounted, setMounted] = React.useState(false);
   const [threads, setThreads] = React.useState<ChatThread[] | null>(null);
-  const [enabled, setEnabled] = React.useState(isAuthConfigured);
+  const [isSignedIn, setIsSignedIn] = React.useState(true);
+  const [loading, setLoading] = React.useState(true);
 
   React.useEffect(() => {
     setMounted(true);
@@ -53,28 +51,32 @@ export function SidebarHistory({
 
   const load = React.useCallback(async () => {
     if (!isAuthConfigured) {
-      setEnabled(false);
+      setIsSignedIn(false);
+      setLoading(false);
       return;
     }
+    setLoading(true);
     try {
       const headers = await authHeader();
       if (!headers) {
-        // Not signed in. Not an error - the middleware will have redirected
-        // anyone who needed to be.
-        setEnabled(false);
+        setIsSignedIn(false);
+        setLoading(false);
         return;
       }
+      setIsSignedIn(true);
       const response = await fetch("/api/history/threads", { headers });
       if (!response.ok) {
-        setEnabled(false);
+        setThreads([]);
+        setLoading(false);
         return;
       }
       const data = await response.json();
-      setEnabled(Boolean(data.enabled));
       setThreads(data.threads ?? []);
     } catch (error) {
       console.error("Could not load chat history:", error);
-      setEnabled(false);
+      setThreads([]);
+    } finally {
+      setLoading(false);
     }
   }, []);
 
@@ -82,13 +84,6 @@ export function SidebarHistory({
     void load();
   }, [load]);
 
-  // A new conversation is saved with a label cut from the first message, then
-  // retitled by the model a moment later. Without a second read the sidebar
-  // keeps showing the truncated version until the page is reloaded, which is
-  // the whole problem this was meant to fix.
-  //
-  // Two reads rather than polling: the rename happens once, shortly after the
-  // thread appears, so a timer that never stops would be cost with no reader.
   React.useEffect(() => {
     if (!activeThreadId) return;
     const timers = [4000, 10000].map((delay) =>
@@ -97,8 +92,6 @@ export function SidebarHistory({
     return () => timers.forEach(window.clearTimeout);
   }, [activeThreadId, load]);
 
-  // Re-fetch threads when a chat turn finishes so that intent-based or profile-based
-  // retitling updates the sidebar in real time.
   React.useEffect(() => {
     let timer: number | null = null;
     const handleTurnDone = () => {
@@ -114,8 +107,6 @@ export function SidebarHistory({
 
   const remove = React.useCallback(
     async (threadId: string) => {
-      // Optimistic: removing a row from a list is trivially undoable by
-      // reloading, and waiting on a round trip to redraw feels broken.
       setThreads((current) => current?.filter((t) => t.id !== threadId) ?? null);
       try {
         const headers = await authHeader();
@@ -126,73 +117,128 @@ export function SidebarHistory({
         });
       } catch (error) {
         console.error("Could not delete that conversation:", error);
-        void load(); // Put it back - the delete did not happen.
+        void load();
       }
     },
     [load],
   );
 
-  if (!mounted || !enabled) return null;
+  if (!mounted) return null;
 
   return (
     <aside
       className={cn(
-        "flex flex-col gap-3 rounded-[16px] border border-border bg-card p-4",
+        "conversation-panel flex flex-col gap-3 rounded-[17px] border border-line p-4 min-w-[280px]",
         className,
       )}
       aria-label="Saved conversations"
     >
-      <h2 className="caption-upper text-muted-foreground">Your conversations</h2>
+      <div className="flex items-center justify-between border-b border-line pb-3">
+        <div>
+          <span className="panel-kicker">HISTORY</span>
+          <h2 className="font-display text-xs font-medium tracking-wider text-ink">
+            CONVERSATIONS
+          </h2>
+        </div>
+        <div className="flex items-center gap-1">
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-muted hover:text-ink"
+              title="Close history panel"
+              aria-label="Close history panel"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
 
-      {threads === null ? (
-        <p className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-          Loading...
+      {!isSignedIn ? (
+        <div className="my-auto flex flex-col items-center justify-center p-4 text-center">
+          <span className="text-2xl text-accent mb-2">↶</span>
+          <p className="font-display text-xs text-ink mb-1">
+            Save your conversations
+          </p>
+          <p className="text-[12px] leading-[1.5] text-muted mb-4">
+            Sign in to save multiple consultations and resume your university search anytime.
+          </p>
+          <Link
+            href="/login?next=%2Fchat"
+            className="button button-primary !py-2.5 !px-4 text-xs w-full justify-center"
+          >
+            Sign in to save <span className="button-arrow">↗</span>
+          </Link>
+        </div>
+      ) : loading && threads === null ? (
+        <p className="flex items-center gap-2 py-4 text-xs text-muted font-display">
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" aria-hidden />
+          Loading conversations...
         </p>
-      ) : threads.length === 0 ? (
-        <p className="text-sm leading-[1.55] text-muted-foreground">
-          Nothing saved yet. This conversation will appear here once you have
-          said something.
-        </p>
+      ) : threads && threads.length === 0 ? (
+        <div className="py-6 text-center">
+          <p className="text-xs leading-[1.55] text-muted">
+            No saved conversations yet. Conversations are automatically saved as you chat with Vera.
+          </p>
+        </div>
       ) : (
-        <ul className="flex flex-col gap-1">
-          {threads.map((thread) => (
-            <li key={thread.id} className="group relative">
-              <button
-                type="button"
-                onClick={() => onOpen?.(thread.id)}
-                className={cn(
-                  "flex w-full items-start gap-2.5 rounded-[12px] px-3 py-2.5 pr-9 text-left transition-colors hover:bg-surface-soft",
-                  thread.id === activeThreadId && "bg-surface-soft",
-                )}
-              >
-                <MessageSquare
-                  className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground"
-                  aria-hidden
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm text-ink">
-                    {thread.title}
+        <ul className="flex flex-1 flex-col gap-1 overflow-y-auto">
+          {threads?.map((thread) => {
+            const isActive = thread.id === activeThreadId;
+            return (
+              <li key={thread.id} className="group relative">
+                <button
+                  type="button"
+                  onClick={() => onOpen?.(thread.id)}
+                  className={cn(
+                    "flex w-full items-start gap-2.5 rounded-[10px] border border-transparent px-3 py-2.5 pr-8 text-left transition-all",
+                    isActive
+                      ? "border-accent/40 bg-accent/15 text-accent font-medium"
+                      : "hover:bg-surface-soft text-muted hover:text-ink",
+                  )}
+                >
+                  <MessageSquare
+                    className={cn(
+                      "mt-0.5 h-3.5 w-3.5 shrink-0",
+                      isActive ? "text-accent" : "text-muted",
+                    )}
+                    aria-hidden
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs font-medium text-ink">
+                      {thread.title}
+                    </span>
+                    <span
+                      className="block font-display text-[9px] text-muted"
+                      suppressHydrationWarning
+                    >
+                      {when(thread.updated_at)}
+                    </span>
                   </span>
-                  <span className="block text-xs text-muted-foreground" suppressHydrationWarning>
-                    {when(thread.updated_at)}
-                  </span>
-                </span>
-              </button>
+                </button>
 
-              <button
-                type="button"
-                onClick={() => void remove(thread.id)}
-                // Visible on hover for a mouse, and always once focused, so it
-                // is reachable from the keyboard rather than hidden from it.
-                className="absolute right-2 top-2.5 rounded-[8px] p-1.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus:opacity-100 group-hover:opacity-100"
-                aria-label={`Delete "${thread.title}"`}
-              >
-                <Trash2 className="h-3.5 w-3.5" aria-hidden />
-              </button>
-            </li>
-          ))}
+                <button
+                  type="button"
+                  onClick={() => void remove(thread.id)}
+                  className="absolute right-2 top-2.5 rounded-[6px] p-1 text-muted opacity-0 transition-opacity hover:text-red-400 focus:opacity-100 group-hover:opacity-100"
+                  aria-label={`Delete "${thread.title}"`}
+                  title="Delete conversation"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+              </li>
+            );
+          })}
         </ul>
+      )}
+
+      {isSignedIn && (
+        <div className="border-t border-line pt-2 text-center">
+          <span className="font-display text-[9px] text-muted uppercase tracking-wider">
+            {threads?.length ?? 0} saved consultation{threads?.length === 1 ? "" : "s"}
+          </span>
+        </div>
       )}
     </aside>
   );

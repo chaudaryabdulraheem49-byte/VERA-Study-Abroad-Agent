@@ -167,12 +167,11 @@ EXTRACTION_PROMPT: Final = """Extract onboarding fields from the student's messa
 Return ONLY a JSON object with these optional keys (omit any key the message \
 does not clearly support — never guess):
 - full_name (string)
-- nationality (string, country name)
+- nationality (string, country name; extract ONLY when the student explicitly states their citizenship or origin, e.g. "I am from Pakistan", "Pakistani", "citizen of India". NEVER infer nationality from academic subjects, languages, or degree names like "English Literature", "French", "German Studies")
 - cgpa: {"raw_value": number, "scale": one of \
 "percentage"|"us_4_0"|"scale_5_0"|"scale_10_0"|"scale_20_0"|"german_1_5"|"unknown", \
 "scale_max": number or null}
-- field_of_study (string; the subject only, e.g. "graphic design" - not the \
-degree name)
+- field_of_study (string; the subject or programme the student studied or is asking to explore/study, e.g. "English Literature", "MBBS and BDS", "Medicine", "Dentistry", "Computer Science". When the user states a completed or desired degree like "I did a BA in English Literature", extract the subject, e.g. "English Literature")
 - education_level: one of "high_school"|"diploma"|"bachelors"|"masters"|\
 "doctorate" - the level the CGPA belongs to. "BS/BSc/BA/BFA/BE/BTech" and \
 "undergraduate" are bachelors; "MS/MSc/MA/MBA/MPhil" are masters; \
@@ -190,11 +189,14 @@ A message may contain several fields at once; extract all of them. \
 scale_10_0. If the student says they have not taken IELTS yet or plan to, \
 use test "PLANNED".
 
-Record only what the student states about THEMSELVES. A question about \
-requirements is not a statement of fact: "what IELTS score do I need for \
-Germany?" tells you neither their score nor their target country, so return \
-{} for it. "Is 3.0 enough for Canada?" likewise records nothing - they are \
-asking, not telling."""
+If the student is asking to see options, courses, or programmes for a subject or destination \
+(e.g. "can you show me options about MBBS and BDS in canada", "show me programmes of MBBS and BDS in canada"), \
+extract field_of_study (e.g. "MBBS and BDS") and target_country (e.g. "Canada").
+
+Record what the student states about themselves or asks to study. A generic question about \
+admission rules ("what IELTS score do I need for Germany?") tells you neither their score nor \
+their target country, so return {} for it. "Is 3.0 enough for Canada?" likewise records nothing - they are \
+asking about general cutoffs, not their own profile."""
 
 
 # --------------------------------------------------------------------------- #
@@ -434,6 +436,15 @@ async def extract_slots(
     if merged.confirms_ocr and not _CONFIRMATION_RE.search(message):
         merged.confirms_ocr = False
 
+    # A student's home country mentioned as nationality must not be mirrored into target_country
+    if (
+        merged.target_country
+        and merged.nationality
+        and same_country(merged.target_country, merged.nationality)
+        and not _TARGET_RE.search(message)
+    ):
+        merged.target_country = None
+
     return _normalise_patch(merged)
 
 
@@ -464,10 +475,24 @@ def _normalise_patch(patch: SlotPatch) -> SlotPatch:
     # A field of study is a subject - graphic design, IT, economics. The model
     # sometimes files a destination there ("in uk"), so anything that resolves
     # to a country is dropped rather than shown as the student's major.
-    if patch.field_of_study and (
-        _lookup_country(patch.field_of_study) or _is_level_only(patch.field_of_study)
+    if patch.field_of_study:
+        fos = patch.field_of_study.strip()
+        if (
+            _lookup_country(fos)
+            or _is_level_only(fos)
+            or _is_pure_nationality(fos)
+            or _NATIONALITY_RE.search(fos)
+            or re.match(r"^(?:i am|i'?m|my|we|he|she|they|this is|here|from)\b", fos, re.IGNORECASE)
+            or any(_lookup_country(w) for w in fos.split() if w.lower() not in _LANGUAGE_OR_DISCIPLINE_WORDS)
+        ):
+            patch.field_of_study = None
+
+    if (
+        patch.target_country
+        and patch.nationality
+        and same_country(patch.target_country, patch.nationality)
     ):
-        patch.field_of_study = None
+        patch.target_country = None
 
     if isinstance(patch.education_level, str):
         # Models sometimes answer with a label rather than the enum value.
@@ -510,7 +535,8 @@ def _asked_hint(state: SessionState) -> str:
         f"We just asked the student for: {asked}. A short reply is usually "
         "answering that - but if it plainly corrects a value already known "
         "(a country, say, when nationality is already set), record it as that "
-        "correction instead. Never put a country in field_of_study."
+        "correction instead. Never put a country in field_of_study. "
+        "Never infer nationality from a field of study or language."
     )
 
 
@@ -609,7 +635,7 @@ _NATIONALITY_RE: Final = re.compile(
 # connective: "usama khan from pakistan" must yield just the name.
 _PHRASE_TAIL_RE: Final = re.compile(
     r"\s+(?:from|and|but|with|who|that|which|studying|study|studied|doing|"
-    r"currently|living|based|born|here|looking)\b.*$",
+    r"currently|living|based|born|here|looking|i|i'?ve|have|my|am|completed|done)\b.*$",
     re.IGNORECASE,
 )
 # Politeness and greeting tokens that sit *beside* a name and are trimmed off
@@ -697,7 +723,7 @@ _DEMONYMS: Final[dict[str, str]] = {
     "argentinian": "Argentina", "colombian": "Colombia", "chilean": "Chile",
     "uzbek": "Uzbekistan", "kazakh": "Kazakhstan", "azerbaijani": "Azerbaijan",
     "georgian": "Georgia", "american": "USA", "british": "UK",
-    "english": "UK", "scottish": "UK", "welsh": "UK", "emirati": "UAE",
+    "scottish": "UK", "welsh": "UK", "emirati": "UAE",
     "new zealander": "New Zealand", "kiwi": "New Zealand",
     "south african": "South Africa",
 }
@@ -761,7 +787,8 @@ _FIELD_RE: Final = re.compile(
     # The trailing \b is load-bearing: without it the short degree tokens match
     # inside longer words, so "bachelors" matched "ba" and filed the remainder,
     # "chelors", as the student's field of study.
-    r"master'?s? (?:in|of)|bs|bsc|ba|bfa|be|btech|mtech|msc|mba)\b\s*"
+    r"master'?s? (?:in|of)|intermediate (?:in|of)|inter (?:in|of)|fsc (?:in|of)|a-levels? (?:in|of)|diploma (?:in|of)|"
+    r"bs|bsc|ba|bfa|be|btech|mtech|msc|mba)\b\s*"
     r"(?:in\s+)?([A-Za-z][A-Za-z &/-]{2,40})",
     re.IGNORECASE,
 )
@@ -949,6 +976,25 @@ def _normalise_country_key(text: str) -> str:
     return re.sub(r"\s+", " ", key).strip()
 
 
+_LANGUAGE_OR_DISCIPLINE_WORDS: Final = frozenset(
+    {
+        "english", "french", "german", "spanish", "chinese", "japanese",
+        "korean", "italian", "russian", "arabic", "portuguese", "dutch",
+        "swedish", "polish", "greek", "turkish", "persian", "latin",
+        "hindi", "urdu",
+    }
+)
+
+_ACADEMIC_MODIFIERS: Final = frozenset(
+    {
+        "literature", "language", "studies", "linguistics", "history",
+        "culture", "philology", "translation", "education", "medium",
+        "major", "degree", "science", "arts", "engineering", "course", "courses",
+        "test", "exam", "proficiency", "teacher", "professor", "curriculum",
+    }
+)
+
+
 def _lookup_country(text: str) -> str | None:
     """Resolve text to a country we actually recognise, tolerating typos.
 
@@ -966,6 +1012,10 @@ def _lookup_country(text: str) -> str | None:
     if compact in _COUNTRY_COMPACT:
         return _COUNTRY_COMPACT[compact]
 
+    # Academic language disciplines are not country names or short forms.
+    if compact in _LANGUAGE_OR_DISCIPLINE_WORDS:
+        return None
+
     # Short forms: "saudi" for Saudi Arabia, "czech" for Czechia. Only accepted
     # when the prefix picks out exactly one country - "united" and "south" each
     # match several, and guessing between them would be worse than asking.
@@ -977,6 +1027,10 @@ def _lookup_country(text: str) -> str | None:
         }
         if len(prefixed) == 1:
             return prefixed.pop()
+
+    # Demonyms are not typos of their country.
+    if compact in _DEMONYMS:
+        return None
 
     # Typos, but only for words long enough that a near match means something.
     # The cutoff is tuned to accept "indiaa"/"germay" while still separating
@@ -999,22 +1053,133 @@ def demonym_country(text: str) -> str | None:
     key = _normalise_country_key(text)
     return _DEMONYMS.get(key) if key else None
 
+_ACADEMIC_PRE_WORDS: Final = frozenset(
+    {
+        "in", "of", "study", "studying", "studied", "major", "majoring",
+        "degree", "bachelor", "bachelors", "ba", "bsc", "bs", "be", "btech",
+        "master", "masters", "ma", "msc", "ms", "mphil", "phd", "diploma",
+        "fsc", "intermediate", "matric", "level", "course", "courses",
+        "class", "classes", "curriculum", "taught", "medium", "learn", "learning",
+        "did", "doing", "completed", "passed",
+    }
+)
+
+
+def _is_pure_nationality(text: str) -> bool:
+    """True if text is solely a nationality / demonym and NOT an academic discipline.
+
+    "Pakistani" and "Indian" are nationalities; "English Literature", "English",
+    "French", "German Studies" are academic subjects.
+    """
+    cleaned = text.strip().lower()
+    words = [w for w in re.split(r"[\s&/.-]+", cleaned) if w]
+    if not words:
+        return False
+    if any(w in _ACADEMIC_MODIFIERS for w in words):
+        return False
+    if any(w in _LANGUAGE_OR_DISCIPLINE_WORDS for w in words):
+        return False
+    for size in (2, 1):
+        for start in range(len(words) - size + 1):
+            if demonym_country(" ".join(words[start : start + size])):
+                return True
+    return False
+
 
 def states_nationality(message: str) -> str | None:
     """The country claimed as citizenship by a nationality word in `message`.
 
     "I am Indian" is unambiguous in a way "India" is not, so asking which slot
-    it belongs to is asking a question the student already answered.
+    it belongs to is asking a question the student already answered. Academic
+    disciplines, qualifications, and languages ("BA in English Literature",
+    "French", "German") are never treated as citizenship claims.
     """
-    # Two-word demonyms first ("new zealander", "sri lankan", "south african"),
-    # then single words. Scanning with one alternating pattern pairs words
-    # greedily - "a new" and then "zealander" - so the compound never forms.
-    words = re.findall(r"[a-z]+", message.lower())
-    for size in (2, 1):
-        for start in range(len(words) - size + 1):
-            found = demonym_country(" ".join(words[start : start + size]))
+    text = message.strip()
+    words = [w for w in re.split(r"[\s.,!?;:]+", text.lower()) if w]
+    if not words:
+        return None
+
+    # Bare demonym answer (1-3 words)
+    if 1 <= len(words) <= 3:
+        cleaned = re.sub(
+            r"^(?:i am|i'?m|im|a|an)\s+", "", text, flags=re.IGNORECASE
+        ).strip(".!, ")
+        cleaned_lower = cleaned.lower()
+        if cleaned_lower in ("british", "english"):
+            return "UK"
+        if cleaned_lower not in _LANGUAGE_OR_DISCIPLINE_WORDS:
+            found = demonym_country(cleaned)
             if found:
                 return found
+
+    # Citizenship phrasing patterns
+    # 1. "I am [demonym]" / "I'm [demonym]"
+    m = re.search(
+        r"\b(?:i am|i'?m|am|as an?|being an?)\s+(?:a\s+|an\s+)?([a-z]+(?:\s+[a-z]+)?)\b(?:\s+([a-z]+))?",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        candidate = m.group(1).lower()
+        next_word = (m.group(2) or "").lower()
+        if next_word not in _ACADEMIC_MODIFIERS:
+            if candidate in ("british", "english"):
+                return "UK"
+            found = demonym_country(candidate)
+            if found:
+                return found
+
+    # 2. "citizen of [country/demonym]", "nationality is [demonym]", "passport of [demonym]"
+    m2 = re.search(
+        r"\b(?:citizen(?:ship)?|national(?:ity)?|passport)\s+(?:of|is|from)?\s*(?:the\s+)?([a-z]+(?:\s+[a-z]+)?)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if m2:
+        candidate = m2.group(1).lower()
+        found = demonym_country(candidate)
+        if found:
+            return found
+
+    # 3. "[demonym] citizen|national|passport holder"
+    m3 = re.search(
+        r"\b([a-z]+(?:\s+[a-z]+)?)\s+(?:citizen|national|passport(?:\s+holder)?|citizenship)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if m3:
+        candidate = m3.group(1).lower()
+        found = demonym_country(candidate)
+        if found:
+            return found
+
+    # 4. "[demonym] student|applicant|candidate|graduate" (only non-language demonyms)
+    m4 = re.search(
+        r"\b([a-z]+(?:\s+[a-z]+)?)\s+(?:student|applicant|candidate|graduate)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if m4:
+        candidate = m4.group(1).lower()
+        if candidate not in _LANGUAGE_OR_DISCIPLINE_WORDS:
+            found = demonym_country(candidate)
+            if found:
+                return found
+
+    # 5. Standalone demonym not in an academic context or language discipline
+    for size in (2, 1):
+        for start in range(len(words) - size + 1):
+            phrase = " ".join(words[start : start + size])
+            if phrase in _LANGUAGE_OR_DISCIPLINE_WORDS:
+                continue
+            prev_word = words[start - 1] if start > 0 else ""
+            next_word = words[start + size] if (start + size) < len(words) else ""
+            if prev_word in _ACADEMIC_PRE_WORDS or next_word in _ACADEMIC_MODIFIERS:
+                continue
+            found = demonym_country(phrase)
+            if found:
+                return found
+
     return None
 
 
@@ -1350,7 +1515,113 @@ def _extract_field(text: str) -> str | None:
     # the spellings _PLACE_WORDS misses ("srilanka", "united states").
     if _lookup_country(candidate):
         return None
+    candidate = re.sub(r"\s+subjects?$", "", candidate, flags=re.IGNORECASE).strip()
+    if candidate.lower() in ("medical", "medicine"):
+        return "Medicine"
+    if candidate.lower() in ("engineering",):
+        return "Engineering"
     return candidate
+
+
+_SEARCH_LEAD_IN_RE: Final = re.compile(
+    r"^(?:can\s+you\s+|could\s+you\s+|please\s+|i\s+want\s+to\s+|i\s+would\s+like\s+to\s+|what\s+are\s+(?:the\s+)?|are\s+there\s+any\s+|tell\s+me\s+about\s+)?"
+    r"(?:show|give|find|search|list|explore|display|recommend|check|see)\s+(?:me\s+)?"
+    r"(?:options?|program(?:me)?s?|courses?|degrees?|universit(?:y|ies))?\s*"
+    r"(?:about|of|for|in|on)?\s*"
+    r"|^(?:what\s+are\s+(?:the\s+)?|are\s+there\s+any\s+|tell\s+me\s+about\s+)"
+    r"(?:options?|program(?:me)?s?|courses?|degrees?|universit(?:y|ies))\s*(?:about|of|for|in|on)?\s*"
+    r"|^(?:options?|program(?:me)?s?|courses?|degrees?|universit(?:y|ies))\s+(?:about|of|for|in|on)\s*",
+    re.IGNORECASE,
+)
+_NOUNS_RE: Final = re.compile(
+    r"\b(options?|program(?:me)?s?|courses?|degrees?)\b",
+    re.IGNORECASE,
+)
+_KNOWN_DEGREE_OR_FIELD_RE: Final = re.compile(
+    r"\b(mbbs|bds|md|dds|dmd|pharmd|nursing|dentistry|dental|medicine|medical|surgery|computer science|data science|artificial intelligence|software engineering|business administration|mba|economics|law|psychology)\b",
+    re.IGNORECASE,
+)
+_MORE_OPTIONS_RE: Final = re.compile(
+    r"\b(more|other|another|different|else|further)\s+(?:options?|program(?:me)?s?|courses?|degrees?|universit(?:y|ies)|choices?)\b"
+    r"|\b(?:show|give|find|search|see|list)\s+more\b"
+    r"|\bwhat\s+else\b"
+    r"|\bany\s+other\b",
+    re.IGNORECASE,
+)
+_ASKS_COURSES_RE: Final = re.compile(
+    r"\b(options?|program(?:me)?s?|courses?|degrees?|universit(?:y|ies)|shortlist|colleges?)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_more_options(text: str) -> bool:
+    """True when the user asks for more or alternative options, courses, or universities."""
+    return bool(_MORE_OPTIONS_RE.search(text))
+
+
+def asks_for_courses(text: str) -> bool:
+    """True when the message asks about courses, programmes, options, or universities."""
+    if asks_for_more_options(text):
+        return True
+    if _SEARCH_LEAD_IN_RE.search(text):
+        return True
+    if _ASKS_COURSES_RE.search(text) and not _NATIONALITY_RE.search(text):
+        return True
+    return False
+
+
+def extract_course_intent(text: str) -> tuple[str | None, str | None]:
+    """Detect if the student is asking to see programmes/options for a subject or country.
+
+    Returns (field_of_study, target_country).
+    """
+    if not asks_for_courses(text):
+        return None, None
+
+    cleaned = re.sub(r"^[?\s!.,\\/]+|[?\s!.,\\/]+$", "", text).strip()
+    if not cleaned:
+        return None, None
+
+    # Country detection: only extract as target country if it's in destination context,
+    # and NEVER if it's introduced as a nationality/origin (e.g. "from Pakistan").
+    country: str | None = None
+    target_match = _TARGET_RE.search(cleaned)
+    if target_match is not None:
+        country = _COUNTRIES.get(target_match.group(1).lower())
+    else:
+        dest_match = re.search(
+            r"\b(?:in|at|for|to)\s+(?:the\s+)?(" + _COUNTRY_ALTERNATION + r")\b",
+            cleaned,
+            re.IGNORECASE,
+        )
+        if dest_match is not None:
+            country = _COUNTRIES.get(dest_match.group(1).lower())
+
+    # Look for known degrees / disciplines first (e.g. MBBS, BDS, MD, Dentistry)
+    found_degrees = _KNOWN_DEGREE_OR_FIELD_RE.findall(cleaned)
+    if found_degrees:
+        field = " and ".join(
+            dict.fromkeys(d.upper() if len(d) <= 4 else d.title() for d in found_degrees)
+        )
+        return field, country
+
+    tail_country_re = re.compile(r"\s+(?:in|at|for|to)\s+[a-zA-Z\s]+$", re.IGNORECASE)
+    subject_part = tail_country_re.sub("", cleaned).strip()
+    subject_part = _SEARCH_LEAD_IN_RE.sub("", subject_part).strip()
+    subject_part = _NOUNS_RE.sub("", subject_part).strip()
+
+    if (
+        not subject_part
+        or subject_part.lower() in {"more", "other", "another", "different", "all", "any", "some", "the"}
+        or _is_level_only(subject_part)
+        or _lookup_country(subject_part)
+        or _NATIONALITY_RE.search(subject_part)
+        or _is_pure_nationality(subject_part)
+        or re.match(r"^(?:i am|i'?m|my|we|he|she|they|this is|here|from)\b", subject_part, re.IGNORECASE)
+    ):
+        subject_part = ""
+
+    return (subject_part or None), country
 
 
 def _extract_score(text: str) -> AcademicScore | None:
@@ -1462,6 +1733,12 @@ def interpret_bare_answer(message: str, slot: SlotName) -> Any | None:
         # "BS" answers the level question, not the subject one.
         if _is_level_only(text):
             return None
+        # Nationality statements ("i am from pakistan", "pakistani") are not a field of study.
+        if _is_pure_nationality(text) or _NATIONALITY_RE.search(text):
+            return None
+        # Sentences starting with personal pronouns/introductions are not a bare field.
+        if re.match(r"^(?:i am|i'?m|my|we|he|she|they|this is|here|from)\b", text, re.IGNORECASE):
+            return None
         if not re.fullmatch(r"[A-Za-z][A-Za-z &/.-]*", text):
             return None
         if not all(_looks_like_word(w) for w in text.split()):
@@ -1493,8 +1770,13 @@ def heuristic_extract(
     patch.full_name = _extract_name(text)
 
     if (match := _NATIONALITY_RE.search(text)) is not None:
-        patch.nationality = _canonical_country(_clean_phrase(match.group(1)))
-    elif (claimed := states_nationality(text)) is not None:
+        cleaned = _clean_phrase(match.group(1)).strip()
+        words = cleaned.split()
+        for n in range(min(len(words), 3), 0, -1):
+            if c := _canonical_country(" ".join(words[:n])):
+                patch.nationality = c
+                break
+    if patch.nationality is None and (claimed := states_nationality(text)) is not None:
         # "I am Indian" says the same thing as "I am from India", and says it
         # about citizenship only - so it fills the slot outright rather than
         # being held back as a country that could belong to either.
@@ -1509,6 +1791,12 @@ def heuristic_extract(
     # is deliberately no longer a fallback for the field.
     if (field := _extract_field(text)) is not None:
         patch.field_of_study = field
+
+    intent_field, intent_country = extract_course_intent(text)
+    if intent_country and not patch.target_country:
+        patch.target_country = intent_country
+    if intent_field and not patch.field_of_study:
+        patch.field_of_study = intent_field
 
     # A level can be mentioned in two quite different senses, and reading one
     # as the other is what put PhDs in front of a student asking for a

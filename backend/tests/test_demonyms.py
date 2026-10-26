@@ -133,7 +133,11 @@ def test_a_short_form_filed_as_a_subject_by_the_model_is_dropped(
 
 @pytest.mark.parametrize(
     "subject",
-    ["graphic design", "computer science", "IT", "economics", "audiology"],
+    [
+        "graphic design", "computer science", "IT", "economics", "audiology",
+        "English Literature", "English", "French Literature", "German Studies",
+        "Spanish",
+    ],
 )
 def test_real_subjects_still_survive(subject: str) -> None:
     """Guard on the above: widening what counts as a country must not start
@@ -142,3 +146,23 @@ def test_real_subjects_still_survive(subject: str) -> None:
     from app.schemas import SlotPatch
 
     assert _normalise_patch(SlotPatch(field_of_study=subject)).field_of_study == subject
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "I did a BA in English Literature",
+        "BA in English",
+        "English Literature",
+        "I did a BA in French Literature",
+        "I want to study German",
+        "My English is good",
+        "I need to take an English test",
+    ],
+)
+def test_academic_and_language_mentions_do_not_set_nationality(message: str) -> None:
+    """Mentions of academic degrees or languages must never set nationality."""
+    assert states_nationality(message) is None
+    patch = heuristic_extract(message, SessionState())
+    assert patch.nationality is None
+

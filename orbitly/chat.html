@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#07101a" />
+    <meta name="description" content="Orbitly AI advisor workspace." />
+    <title>Advisor workspace — Orbitly</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="app-page">
+    <div class="chat-shell">
+      <aside class="chat-rail" aria-label="Workspace navigation">
+        <a class="rail-brand" href="/" aria-label="Orbitly home"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span></a>
+        <div class="rail-divider"></div>
+        <button class="rail-icon is-active" type="button" aria-label="Advisor"><span>✧</span></button>
+        <button class="rail-icon" type="button" aria-label="Saved matches"><span>▦</span></button>
+        <button class="rail-icon" type="button" aria-label="Explore"><span>◉</span></button>
+        <div class="rail-spacer"></div>
+        <button class="rail-icon rail-history" type="button" aria-label="History"><span>↶</span></button>
+      </aside>
+
+      <div class="chat-workspace">
+        <header class="app-topbar">
+          <a class="brand" href="/" aria-label="Orbitly home"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span><span class="brand-name">ORBITLY</span></a>
+          <span class="app-separator"></span><span class="app-context"><i></i> ADVISOR WORKSPACE</span>
+          <div class="app-actions"><a class="app-help" href="/">?</a><button class="theme-toggle" type="button" aria-label="Switch theme" data-theme-toggle><span class="theme-toggle-icon" aria-hidden="true">◐</span><span data-theme-label>Light mode</span></button><a class="user-avatar" href="/login">CG</a></div>
+        </header>
+
+        <main class="chat-layout">
+          <section class="conversation-panel" aria-labelledby="chat-title">
+            <header class="chat-header"><div class="advisor-identity"><span class="advisor-orb">✦</span><div><h1 id="chat-title">Vera <span>— Study Abroad Advisor</span></h1><p><span class="status-pip"></span> 0 OF 7 DETAILS COLLECTED</p></div></div><a class="new-chat" href="/chat">↻ &nbsp; New chat</a></header>
+            <div class="conversation-body">
+              <div class="conversation-hero"><span class="conversation-kicker">ORBITLY / CONVERSATION 001</span><h2>Where shall we begin?</h2><p>Tell me where you studied and what you are aiming for, or drop your transcript in and I will read it.</p><div class="suggestion-grid"><button type="button" class="suggestion-chip" data-suggestion="I did a BA in English Literature">I did a BA in English Literature</button><button type="button" class="suggestion-chip" data-suggestion="I want to study in Australia">I want to study in Australia</button><button type="button" class="suggestion-chip" data-suggestion="What can I do with my 3.2 GPA?">What can I do with my 3.2 GPA?</button><button type="button" class="suggestion-chip" data-suggestion="Read my transcript for me">Read my transcript for me</button></div></div>
+              <div class="conversation-note"><span class="note-pulse"></span><span>Vera asks one useful question at a time. Your profile takes shape as you talk.</span></div>
+            </div>
+            <form class="composer" data-chat-form><button type="button" class="attach-button" aria-label="Attach transcript">⌕</button><input name="message" autocomplete="off" placeholder="Tell me about yourself, or drop your transcript here..." aria-label="Message Vera" /><button type="submit" class="send-button" aria-label="Send message">↑</button></form>
+          </section>
+
+          <aside class="profile-panel" aria-label="Your profile progress"><div class="profile-heading"><div><span class="panel-kicker">YOUR PROFILE</span><h2>Signals</h2></div><span class="profile-count">0/7</span></div><div class="profile-progress"><span></span></div><ul class="profile-list"><li><span class="check-ring"></span><div><b>FULL NAME</b><small>Not provided yet</small></div></li><li><span class="check-ring"></span><div><b>NATIONALITY</b><small>Not provided yet</small></div></li><li><span class="check-ring"></span><div><b>CGPA / GRADE</b><small>Not provided yet</small></div></li><li><span class="check-ring"></span><div><b>FIELD OF STUDY</b><small>Not provided yet</small></div></li><li><span class="check-ring"></span><div><b>LEVEL OF STUDY</b><small>Not provided yet</small></div></li><li><span class="check-ring"></span><div><b>TARGET COUNTRY</b><small>Not provided yet</small></div></li><li><span class="check-ring"></span><div><b>IELTS / TOEFL</b><small>Not provided yet</small></div></li></ul><div class="profile-lock"><span>⌑</span><p>All 7 details are needed before I can run your diagnostic report.</p></div></aside>
+        </main>
+      </div>
+    </div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

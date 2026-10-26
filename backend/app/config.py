@@ -43,7 +43,7 @@ _MODEL_DEFAULTS: Final[dict[str, dict[str, str]]] = {
         # a normal conversation clear of both the per-minute and daily caps.
         "chat_model": "gemini-3.5-flash-lite",
         "vision_model": "gemini-3.5-flash-lite",
-        "extraction_model": "gemini-3.1-flash-lite",
+        "extraction_model": "gemini-3.5-flash-lite",
         # 3.5, not 3.1: the 3.1 lite tier returns a persistent 503 "high
         # demand" for the long extraction prompts this pipeline sends.
         "crawler_model": "gemini-3.5-flash-lite",

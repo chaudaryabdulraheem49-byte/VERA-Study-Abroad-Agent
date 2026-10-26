@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Final
 
@@ -48,19 +48,23 @@ from .llm_service import (
     _chunk_text,
     generate_title,
     TurnStatus,
+    asks_for_courses,
+    asks_for_more_options,
+    asks_to_share_transcript,
     bare_country,
     country_aliases,
     extract_countries,
+    extract_course_intent,
     extract_slots,
     is_affirmation,
     is_negation,
-    asks_to_share_transcript,
     looks_like_noise,
     means_every_option,
     resolve_country_role,
     title_name,
     same_country,
     states_country_role,
+    states_nationality,
     stream_reply,
 )
 from .ocr_service import TranscriptParseError, parse_transcript
@@ -171,7 +175,7 @@ GREETING: Final = (
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.sessions = build_session_store()
     logger.info("Session store: %s", type(app.state.sessions).__name__)
     try:
@@ -391,23 +395,32 @@ async def discover_courses(
 
     query_stmt = select(Course)
     if country:
-        query_stmt = query_stmt.where(Course.country.in_(country_aliases(country)))
+        c_clean = country.strip().lower()
+        if c_clean in ("europe", "eu", "all europe", "europe (all)"):
+            from .course_matching import _REGIONS
+            query_stmt = query_stmt.where(Course.country.in_(_REGIONS["europe"]))
+        else:
+            query_stmt = query_stmt.where(Course.country.in_(country_aliases(country)))
     if degree_level:
-        query_stmt = query_stmt.where(Course.degree_level == degree_level)
+        if degree_level.strip().lower() == "diploma":
+            query_stmt = query_stmt.where(Course.degree_level.ilike("%diploma%"))
+        else:
+            query_stmt = query_stmt.where(Course.degree_level == degree_level)
 
     search_raw = (field_broad or query or "").strip()
     if search_raw:
         expanded = expand_field(search_raw)
         is_known_abbrev = search_raw.lower() in _FIELD_EXPANSIONS
+        is_short = len(search_raw) <= 4 and bool(re.match(r"^[A-Za-z0-9]+$", search_raw))
 
         search_conditions = []
-        main_terms = set()
+        substring_terms = set()
         if expanded and expanded.lower() != search_raw.lower():
-            main_terms.add(expanded)
-        if not is_known_abbrev:
-            main_terms.add(search_raw)
+            substring_terms.add(expanded)
+        if not is_short:
+            substring_terms.add(search_raw)
 
-        for term in main_terms:
+        for term in substring_terms:
             pattern = f"%{term}%"
             search_conditions.extend([
                 Course.course_title.ilike(pattern),
@@ -418,15 +431,24 @@ async def discover_courses(
             ])
 
         # For short acronyms (e.g. IT, AI, CS, MBA), match as a whole word boundary
-        # in the course_title only (e.g. "Master of IT"), NEVER as a loose substring
+        # in the course_title, field_broad, field_narrow, NEVER as a loose substring
         # '%it%' which would match 'university', 'credit', etc.
-        if len(search_raw) <= 4 and re.match(r"^[A-Za-z0-9]+$", search_raw):
+        if is_short:
             safe_token = re.escape(search_raw)
-            search_conditions.append(
-                Course.course_title.op("~*")(rf"\y{safe_token}\y")
-            )
+            wb_pattern = rf"\y{safe_token}\y"
+            search_conditions.extend([
+                Course.course_title.op("~*")(wb_pattern),
+                Course.field_broad.op("~*")(wb_pattern),
+                Course.field_narrow.op("~*")(wb_pattern),
+            ])
+            # If there was no expansion, allow word-boundary match in syllabus too
+            if not expanded or expanded.lower() == search_raw.lower():
+                search_conditions.append(
+                    Course.syllabus_description.op("~*")(wb_pattern)
+                )
 
-        query_stmt = query_stmt.where(or_(*search_conditions))
+        if search_conditions:
+            query_stmt = query_stmt.where(or_(*search_conditions))
 
     if free_only:
         query_stmt = query_stmt.where(Course.tuition_fee_usd <= 0)
@@ -664,6 +686,13 @@ async def _event_stream(
             )
             patch = await extract_slots(message, state, status=turn)
 
+            intent_field, intent_country = extract_course_intent(message)
+            if intent_field and not patch.field_of_study:
+                patch.field_of_study = intent_field
+            if intent_country and not patch.target_country:
+                if not (patch.nationality and same_country(intent_country, patch.nationality)):
+                    patch.target_country = intent_country
+
             # While transcript values are awaiting review, the review is the
             # only question on the table. Anything else the student mentions is
             # set aside rather than recorded, so the profile cannot grow around
@@ -782,6 +811,13 @@ async def _event_stream(
                 elif is_negation(message):
                     state.pending_same_country = None
                     patch.target_country = None
+                elif (
+                    states_nationality(message)
+                    or (states_country_role(message) and patch.nationality)
+                    or (patch.nationality and same_country(patch.nationality, state.pending_same_country))
+                ):
+                    state.pending_same_country = None
+                    patch.target_country = None
                 else:
                     patch.target_country = None
             elif patch.target_country and same_country(
@@ -817,6 +853,17 @@ async def _event_stream(
                 if state.diagnostics_unlocked:
                     rematch = True
                 yield _frame(SSEEventType.SLOT_UPDATE, _slot_snapshot(state))
+
+            # If user asks for courses/programmes or more options, and diagnostics is already unlocked,
+            # we must refresh and emit matching programmes even if slots were already set.
+            asking_courses = bool(message) and (
+                asks_for_courses(message)
+                or asks_for_more_options(message)
+                or intent_field is not None
+                or intent_country is not None
+            )
+            if state.diagnostics_unlocked and asking_courses:
+                rematch = True
 
         # 4. Decide what this turn should say.
         directive, fallback, card = _plan_turn(
@@ -919,19 +966,27 @@ async def _event_stream(
             ):
                 yield frame
 
-        elif rematch and state.last_card is not None:
-            # The report is unchanged and must not be re-sent, but what the
-            # student is asking for has changed - a different level, a
-            # different destination, a different subject. Matching runs again
-            # on its own so the grid answers the question actually asked.
-            yield _frame(
-                SSEEventType.STATUS,
-                {"stage": "matching", "message": "Finding programmes that fit..."},
-            )
-            async for frame in _emit_matches(
-                state, state.last_card, user=user, thread_id=thread_id
-            ):
-                yield frame
+        elif rematch and (state.last_card is not None or state.diagnostics_unlocked):
+            card = state.last_card
+            if card is None and state.slots.is_complete():
+                try:
+                    card = build_card(state)
+                    state.last_card = card
+                except Exception:
+                    card = None
+            if card is not None:
+                # Synchronize card's field and target country with current slot selections
+                card.field_of_study = state.slots.field_of_study
+                card.target_country = state.slots.target_country
+                more = bool(message) and asks_for_more_options(message)
+                yield _frame(
+                    SSEEventType.STATUS,
+                    {"stage": "matching", "message": "Finding programmes that fit..."},
+                )
+                async for frame in _emit_matches(
+                    state, card, user=user, thread_id=thread_id, more=more
+                ):
+                    yield frame
 
         if turn.rate_limited:
             yield _frame(
@@ -1479,6 +1534,7 @@ async def _emit_matches(
     *,
     user: AuthenticatedUser | None = None,
     thread_id: str | None = None,
+    more: bool = False,
 ) -> AsyncIterator[str]:
     """Search the course index and emit the matches, or say why there are none.
 
@@ -1487,7 +1543,8 @@ async def _emit_matches(
     is a degraded turn, not a failed one.
     """
     try:
-        result = await find_matches(state, card)
+        top_k = 10 if more else 6
+        result = await find_matches(state, card, top_k=top_k)
     except MatchingUnavailable as exc:
         logger.warning("Course matching unavailable for %s: %s", state.session_id, exc)
         if exc.quota_exhausted:

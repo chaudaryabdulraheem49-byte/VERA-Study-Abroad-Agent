@@ -1,0 +1,3 @@
+# Pyrefly Language Server configuration for backend directory
+search-path = ["."]
+site-package-path = [".venv/Lib/site-packages"]

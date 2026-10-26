@@ -35,7 +35,26 @@ interface Programme {
   deadline_type: string | null;
 }
 
-const COUNTRIES = ["Australia", "United Kingdom", "Canada", "Germany", "United States"];
+const COUNTRIES = [
+  "Australia",
+  "Austria",
+  "Belgium",
+  "Canada",
+  "Denmark",
+  "Finland",
+  "France",
+  "Germany",
+  "Ireland",
+  "Italy",
+  "Netherlands",
+  "Norway",
+  "Poland",
+  "Sweden",
+  "Switzerland",
+  "United Kingdom",
+  "United States",
+  "Europe (All)",
+];
 const LEVELS = ["Bachelors", "Masters", "PhD", "Diploma"];
 
 export default function DiscoveryPage() {
@@ -76,14 +95,21 @@ export default function DiscoveryPage() {
         <SideDock />
 
         <div className="min-w-0 flex-1 space-y-4">
-          <header className="glass relative z-20 flex items-center gap-3 rounded-[18px] px-4 py-3">
-            <Link href="/chat" className="display-sm text-ink">
-              Vera
+          <header className="app-topbar">
+            <Link className="brand" href="/" aria-label="Orbitly home">
+              <span className="brand-mark" aria-hidden="true">
+                <span></span>
+                <span></span>
+                <span></span>
+              </span>
+              <span className="brand-name">ORBITLY</span>
             </Link>
-            <span aria-hidden className="h-4 w-px bg-hairline" />
-            <p className="caption-upper text-muted-ink">University discovery</p>
+            <span className="app-separator"></span>
+            <span className="app-context">
+              <i></i> UNIVERSITY DISCOVERY
+            </span>
             <div className="ml-auto">
-              <ThemeToggle />
+              <ThemeToggle showLabel={false} />
             </div>
           </header>
 
@@ -197,9 +223,13 @@ function ProgrammeCard({ row, index }: { row: Programme; index: number }) {
   // figure is a conversion, so it is only the fallback.
   const tuition =
     row.tuition_fee_amount !== null && row.currency
-      ? `${row.currency} ${row.tuition_fee_amount.toLocaleString()}`
+      ? row.tuition_fee_amount === 0
+        ? "Free (0 EUR)"
+        : `${row.currency} ${row.tuition_fee_amount.toLocaleString()}`
       : row.tuition_fee_usd
-        ? `US$${row.tuition_fee_usd.toLocaleString()}`
+        ? row.tuition_fee_usd === 0
+          ? "Free (0 EUR)"
+          : `US$${row.tuition_fee_usd.toLocaleString()}`
         : null;
 
   return (
@@ -211,9 +241,9 @@ function ProgrammeCard({ row, index }: { row: Programme; index: number }) {
         <p className="caption-upper text-cyan">{row.field_broad}</p>
       ) : null}
 
-      <h2 className="mt-2 text-[16px] font-semibold leading-[1.35] text-ink">
+      <h3 className="programme-card-title mt-2 font-sans text-[16px] font-semibold leading-[1.35] tracking-tight text-ink break-words">
         {row.course_title}
-      </h2>
+      </h3>
 
       {row.university_name ? (
         <p className="mt-1 text-sm text-muted-ink">{row.university_name}</p>

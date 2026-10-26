@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#07101a" />
+    <meta name="description" content="Orbitly is the AI study-abroad advisor that finds the university fit behind your ambitions." />
+    <title>Orbitly — Study abroad, better matched</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="site-shell">
+      <header class="topbar" aria-label="Primary navigation">
+        <a class="brand" href="#top" aria-label="Orbitly home">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span class="brand-name">ORBITLY</span>
+        </a>
+        <nav class="nav-links">
+          <a class="nav-link is-active" href="#top">Overview</a>
+          <a class="nav-link" href="#how-it-works">How it works</a>
+          <a class="nav-link" href="#signals">Signals</a>
+          <a class="nav-link" href="#faq">FAQ</a>
+        </nav>
+        <div class="topbar-actions">
+          <button class="theme-toggle" type="button" aria-label="Switch theme" data-theme-toggle>
+            <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+            <span data-theme-label>Light mode</span>
+          </button>
+          <a class="button button-dark" href="/chat">Find my match <span class="button-arrow">↗</span></a>
+        </div>
+        <button class="mobile-menu" type="button" aria-label="Open navigation" data-menu-button><span></span><span></span></button>
+      </header>
+
+      <main id="top">
+        <section class="hero-section" aria-labelledby="hero-title">
+          <div class="hero-backdrop" aria-hidden="true"><span class="hero-halo"></span><span class="hero-grid"></span><span class="hero-sweep sweep-one"></span><span class="hero-sweep sweep-two"></span></div>
+          <div class="hero-noise" aria-hidden="true"></div>
+          <div class="hero-content">
+            <div class="eyebrow reveal"><span class="eyebrow-dot"></span> The intelligent route to your next chapter</div>
+            <h1 id="hero-title" class="hero-title reveal reveal-delay-1">Find the place<br /><em>you’ll thrive.</em></h1>
+            <p class="hero-copy reveal reveal-delay-2">Orbitly reads between the lines of your ambitions to surface universities that feel like <strong>your kind of possible.</strong></p>
+            <div class="hero-actions reveal reveal-delay-3">
+              <a class="button button-primary" href="/chat">Map my future <span class="button-arrow">↗</span></a>
+              <a class="text-link" href="#how-it-works">See how it thinks <span>↓</span></a>
+            </div>
+            <div class="hero-footnote reveal reveal-delay-4"><span class="signal-line"></span><span>Built for curious minds crossing borders</span></div>
+          </div>
+          <div class="hero-orbit-orb orb-one" aria-hidden="true"></div>
+          <div class="hero-orbit-orb orb-two" aria-hidden="true"></div>
+          <div class="hero-coordinate" aria-hidden="true"><span>40.7128° N</span><span>74.0060° W</span></div>
+          <div class="hero-scroll-cue" aria-hidden="true"><span class="scroll-line"></span><span>Scroll to explore</span></div>
+        </section>
+
+        <section class="signal-strip" id="signals" aria-label="Orbitly signals">
+          <div><span class="strip-label">A better shortlist</span><span class="strip-value">92%</span><span class="strip-detail">students discover a new fit</span></div>
+          <div><span class="strip-label">Less noise</span><span class="strip-value">18 min</span><span class="strip-detail">to your first clear direction</span></div>
+          <div><span class="strip-label">More you</span><span class="strip-value">24</span><span class="strip-detail">signals behind every match</span></div>
+        </section>
+
+        <section class="match-section section-shell" id="match" aria-labelledby="match-title">
+          <div class="section-kicker"><span>01</span><span class="kicker-rule"></span><span>THE MATCH ENGINE</span></div>
+          <div class="match-layout">
+            <div class="match-intro">
+              <h2 id="match-title">Your future<br /><span>has a pattern.</span></h2>
+              <p>Forget sorting by rankings alone. Orbitly blends what you want to study, how you want to live, and the kind of stretch you’re ready for.</p>
+              <div class="match-note"><span class="note-orbit">✦</span><span>Every recommendation comes with a reason you can actually feel.</span></div>
+            </div>
+            <div class="match-board" aria-label="Interactive university match preview">
+              <div class="board-topline"><span>YOUR SIGNALS</span><span class="live-chip"><i></i> LIVE PREVIEW</span></div>
+              <div class="preference-row">
+                <span class="preference-label">I want to study</span>
+                <div class="chip-set" data-choice-group="study">
+                  <button class="choice-chip is-selected" type="button" data-value="Creative technology">Creative technology</button>
+                  <button class="choice-chip" type="button" data-value="Climate science">Climate science</button>
+                  <button class="choice-chip" type="button" data-value="Business &amp; design">Business &amp; design</button>
+                </div>
+              </div>
+              <div class="preference-row">
+                <span class="preference-label">I’m drawn to</span>
+                <div class="chip-set" data-choice-group="place">
+                  <button class="choice-chip is-selected" type="button" data-value="Big city energy">Big city energy</button>
+                  <button class="choice-chip" type="button" data-value="Coastal calm">Coastal calm</button>
+                  <button class="choice-chip" type="button" data-value="Mountain air">Mountain air</button>
+                </div>
+              </div>
+              <div class="match-result">
+                <div class="result-orbit" aria-hidden="true"><span class="result-core">98%</span><span class="result-orbit-dot dot-a"></span><span class="result-orbit-dot dot-b"></span></div>
+                <div class="result-copy"><span class="result-label">YOUR FIRST SIGNAL</span><h3 data-result-title>Parsons School of Design</h3><p data-result-copy>Because your creative edge wants a city that keeps moving.</p><div class="result-tags"><span data-result-study>Creative technology</span><span data-result-place>Big city energy</span></div></div>
+                <button class="result-arrow" type="button" aria-label="Explore your match">↗</button>
+              </div>
+              <div class="board-footer"><span>Orbitly confidence</span><span class="confidence-bars"><i></i><i></i><i></i><i></i><i></i><b>High</b></span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="story-section section-shell" id="how-it-works" aria-labelledby="story-title">
+          <div class="section-kicker"><span>02</span><span class="kicker-rule"></span><span>HOW IT THINKS</span></div>
+          <div class="story-heading"><h2 id="story-title">Not a database.<br /><span>A point of view.</span></h2><p>Good guidance feels less like a search result and more like someone finally asking the right question.</p></div>
+          <div class="story-rail">
+            <article class="story-card story-card-dark"><span class="card-index">01 / LISTEN</span><div class="card-symbol">⌁</div><h3>Start with the why.</h3><p>Your goals, your pace, your non-negotiables. We look for the signal behind the search.</p><span class="card-caption">The human layer</span></article>
+            <article class="story-card story-card-light"><span class="card-index">02 / CONNECT</span><div class="card-symbol">✳</div><h3>Draw the invisible line.</h3><p>We connect your signals to programs, cities, cultures, and the everyday life around campus.</p><span class="card-caption">The context layer</span></article>
+            <article class="story-card story-card-coral"><span class="card-index">03 / ARRIVE</span><div class="card-symbol">↗</div><h3>Move with clarity.</h3><p>Walk away with a shortlist that sounds like you — and a next step you can act on today.</p><span class="card-caption">The momentum layer</span></article>
+          </div>
+        </section>
+
+        <section class="cta-section section-shell" id="faq" aria-labelledby="cta-title">
+          <div class="cta-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div class="cta-content"><span class="section-kicker section-kicker-center"><span>03</span><span class="kicker-rule"></span><span>YOUR NEXT MOVE</span></span><h2 id="cta-title">The right place<br /><em>changes everything.</em></h2><p>Start with a few signals. Leave with a direction that feels distinctly yours.</p><a class="button button-primary" href="/chat">Begin the orbit <span class="button-arrow">↗</span></a></div>
+          <div class="cta-aside"><span class="aside-label">ORBITLY / 001</span><span class="aside-text">A more human way<br />to study abroad.</span><span class="aside-coordinate">51.5072° N<br />0.1276° W</span></div>
+        </section>
+      </main>
+
+      <footer class="footer"><a class="brand" href="#top"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span><span class="brand-name">ORBITLY</span></a><span>© 2026 Orbitly AI</span><span>Made for the next chapter</span><a href="#top" class="back-top">Back to top ↑</a></footer>
+    </div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

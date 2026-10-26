@@ -10,8 +10,9 @@ narrowed set.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
-from typing import Any
+from typing import Any, Final
 
 from qdrant_client import AsyncQdrantClient, models
 from sqlalchemy import Select, select
@@ -60,7 +61,55 @@ async def search_courses(
             user_constraints=constraints,
             user_query_vector=vector,
             top_k=top_k,
+            query_text=query,
         )
+
+
+_LEXICAL_STOPWORDS: Final[set[str]] = {
+    "in", "at", "and", "or", "of", "the", "a", "an", "for", "to", "with",
+    "bachelors", "masters", "master", "bachelor", "phd", "degree", "program",
+    "programme", "study", "studies", "msc", "bsc", "ba", "ma", "postgraduate",
+    "undergraduate", "international", "university",
+}
+
+
+def _compute_lexical_score(query_text: str, course: Course) -> float:
+    """Fallback similarity score when vectors are not yet indexed."""
+    if not query_text:
+        return 0.0
+
+    q_lower = query_text.lower()
+    t_lower = (course.course_title or "").lower()
+    s_lower = (course.syllabus_description or "").lower()
+
+    words = re.findall(r"\b[a-zA-Z]{2,}\b", q_lower)
+    keywords = [w for w in words if w not in _LEXICAL_STOPWORDS]
+    if not keywords:
+        keywords = words
+    if not keywords:
+        return 0.65
+
+    phrase = " ".join(keywords[:2])
+    if phrase and phrase in t_lower:
+        return 0.85
+
+    matched_title = sum(1 for kw in keywords if kw in t_lower)
+    title_ratio = matched_title / len(keywords)
+
+    matched_syllabus = sum(1 for kw in keywords if kw in s_lower)
+    syllabus_ratio = matched_syllabus / len(keywords)
+
+    if title_ratio >= 1.0:
+        return 0.82
+    elif title_ratio >= 0.5:
+        return 0.75
+    elif matched_title >= 1:
+        return 0.68
+    elif syllabus_ratio >= 0.5:
+        return 0.62
+    elif matched_syllabus >= 1:
+        return 0.50
+    return 0.25
 
 
 async def execute_hybrid_search(
@@ -70,6 +119,7 @@ async def execute_hybrid_search(
     user_query_vector: list[float],
     *,
     top_k: int | None = None,
+    query_text: str | None = None,
 ) -> list[CourseMatch]:
     """Run the two-step search and return the top matches, best first."""
     settings = get_settings()
@@ -89,13 +139,22 @@ async def execute_hybrid_search(
         limit=limit,
     )
     if not scores:
-        # The filter matched but nothing is embedded yet. Returning the
-        # eligible courses unranked beats returning nothing at all.
+        # The filter matched but nothing is embedded yet. Rank lexically by
+        # course title & syllabus rather than returning unranked 0.0 scores
+        # that get dropped by the downstream relevance filter.
         logger.warning(
-            "Hybrid search: %d candidates had no vectors; returning unranked",
+            "Hybrid search: %d candidates had no vectors; ranking lexically",
             len(candidates),
         )
-        return [_to_match(row, 0.0) for row in list(candidates.values())[:limit]]
+        scored_candidates = [
+            (row, _compute_lexical_score(query_text or "", row))
+            for row in candidates.values()
+        ]
+        scored_candidates.sort(
+            key=lambda pair: (pair[1], -(pair[0].tuition_fee_usd or 0.0)),
+            reverse=True,
+        )
+        return [_to_match(row, score) for row, score in scored_candidates[:limit]]
 
     return [
         _to_match(candidates[course_id], score)

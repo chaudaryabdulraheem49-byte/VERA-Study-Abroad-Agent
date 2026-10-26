@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Final
 
@@ -139,14 +139,16 @@ class Course(Base):
     next_deadline: Mapped[str | None] = mapped_column(String(10), nullable=True)
     # Free text as the source words it ("February and July"), never invented.
     intakes: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    tuition_fee_cad: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tuition_fee_eur: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class University(Base):
-    """One CRICOS-registered provider.
+    """One registered provider (CRICOS, IRCC DLI, or international).
 
-    The primary key is the provider's own CRICOS code rather than a surrogate:
-    it is the join key in the source data, it is stable across releases, and it
-    makes a row traceable back to the register without a lookup.
+    The primary key is the provider's code (CRICOS code or IRCC DLI number)
+    rather than a surrogate: it is stable across releases and makes a row
+    traceable back to the source register without a lookup.
     """
 
     __tablename__ = "universities"
@@ -161,6 +163,32 @@ class University(Base):
     state: Mapped[str | None] = mapped_column(String(20), nullable=True)
     postcode: Mapped[str | None] = mapped_column(String(10), nullable=True)
     country: Mapped[str] = mapped_column(String(100), nullable=False, default="Australia")
+    offers_pgwp: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    dli_number: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+
+
+class Institution(Base):
+    """Designated Learning Institution (DLI) or foreign education provider."""
+
+    __tablename__ = "institutions"
+    __table_args__ = (
+        UniqueConstraint(
+            "dli_number", "campus_location", "city", name="uq_institutions_dli_campus_city"
+        ),
+    )
+
+    institution_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    dli_number: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    institution_name: Mapped[str] = mapped_column(String(300), nullable=False, index=True)
+    province: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    campus_location: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    offers_pgwp: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_public: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    country: Mapped[str] = mapped_column(String(100), nullable=False, default="Canada", index=True)
+    website: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 # Composite indexes for the shapes the hard filter and discovery actually run:
@@ -198,6 +226,11 @@ _DDL_COLUMNS: Final[tuple[str, ...]] = (
     "CREATE INDEX IF NOT EXISTS ix_courses_university_id ON courses (university_id)",
     "CREATE INDEX IF NOT EXISTS ix_courses_external_code "
     "ON courses (external_course_code)",
+    "ALTER TABLE courses ADD COLUMN IF NOT EXISTS tuition_fee_cad DOUBLE PRECISION",
+    "ALTER TABLE courses ADD COLUMN IF NOT EXISTS tuition_fee_eur DOUBLE PRECISION",
+    "ALTER TABLE universities ADD COLUMN IF NOT EXISTS offers_pgwp BOOLEAN",
+    "ALTER TABLE universities ADD COLUMN IF NOT EXISTS dli_number VARCHAR(30)",
+    "CREATE INDEX IF NOT EXISTS ix_universities_dli ON universities (dli_number)",
 )
 
 _engine: AsyncEngine | None = None
@@ -229,7 +262,7 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 @asynccontextmanager
-async def session_scope() -> AsyncIterator[AsyncSession]:
+async def session_scope() -> AsyncGenerator[AsyncSession, None]:
     """A transactional session: commit on success, roll back on failure."""
     factory = get_session_factory()
     async with factory() as session:

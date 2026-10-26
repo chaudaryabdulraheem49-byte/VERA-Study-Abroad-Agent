@@ -238,6 +238,23 @@ class Checkpoint:
         temporary.replace(self.path)
 
 
+EUROPEAN_COUNTRIES: Final[set[str]] = {
+    "Germany",
+    "Netherlands",
+    "Ireland",
+    "Sweden",
+    "France",
+    "Italy",
+    "Switzerland",
+    "Finland",
+    "Norway",
+    "Denmark",
+    "Poland",
+    "Austria",
+    "Belgium",
+}
+
+
 async def pending_courses(
     client,
     checkpoint: Checkpoint | None = None,
@@ -245,6 +262,8 @@ async def pending_courses(
     match: str | None = None,
     level: str | None = None,
     country: str | None = None,
+    region: str | None = None,
+    limit: int | None = None,
 ) -> list[Course]:
     """Courses with no vector yet, optionally narrowed to a subset.
 
@@ -262,13 +281,25 @@ async def pending_courses(
             query = query.where(Course.course_title.ilike(f"%{match}%"))
         if level:
             query = query.where(Course.degree_level == level)
+        if region:
+            r = region.lower().strip()
+            if r in {"europe", "eu", "european"}:
+                query = query.where(Course.country.in_(sorted(EUROPEAN_COUNTRIES)))
+            elif r in {"australia", "aus"}:
+                query = query.where(Course.country == "Australia")
+            elif r in {"canada", "cad"}:
+                query = query.where(Course.country == "Canada")
         if country:
-            query = query.where(Course.country == country)
+            if "," in country:
+                c_list = [c.strip() for c in country.split(",") if c.strip()]
+                query = query.where(Course.country.in_(c_list))
+            else:
+                query = query.where(Course.country == country)
         rows = (await session.execute(query)).scalars().all()
         # Detached from the session deliberately: the loop below runs long
         # network calls, and holding a transaction open across them would pin a
         # connection for the whole run.
-        return [
+        courses = [
             Course(
                 course_id=row.course_id,
                 course_title=row.course_title,
@@ -283,6 +314,9 @@ async def pending_courses(
             for row in rows
             if str(row.course_id) not in done
         ]
+        if limit and limit > 0:
+            courses = courses[:limit]
+        return courses
 
 
 async def backfill(
@@ -383,7 +417,13 @@ async def run(args: argparse.Namespace) -> int:
 
     checkpoint = Checkpoint(Path(args.checkpoint))
     courses = await pending_courses(
-        client, checkpoint, match=args.match, level=args.level, country=args.country
+        client,
+        checkpoint,
+        match=args.match,
+        level=args.level,
+        country=args.country,
+        region=args.region,
+        limit=args.limit,
     )
     held = len(await existing_ids(client))
 
@@ -397,16 +437,22 @@ async def run(args: argparse.Namespace) -> int:
     print(f"Checkpoint            {checkpoint.path}")
     print(f"Courses in Postgres   {total:>7,}")
     print(f"Vectors already held  {held:>7,}")
-    narrowed = [f for f in (args.match, args.level, args.country) if f]
+    narrowed = [f for f in (args.match, args.level, args.region, args.country) if f]
     if narrowed:
         print(f"Narrowed to           {', '.join(narrowed)}")
+    if args.limit:
+        print(f"Limit requested       {args.limit:>7,}")
     print(f"To embed              {len(courses):>7,}")
     spent = checkpoint.spent_today()
-    left_today = max(args.daily_limit - spent, 0)
-    print(
-        f"Free-tier budget      {left_today:>7,} of {args.daily_limit:,} "
-        f"text(s) left today (UTC)"
-    )
+    if args.ignore_daily_budget:
+        left_today = args.daily_limit
+        print("Daily budget check:   BYPASS (--ignore-daily-budget enabled)")
+    else:
+        left_today = max(args.daily_limit - spent, 0)
+        print(
+            f"Free-tier budget      {left_today:>7,} of {args.daily_limit:,} "
+            f"text(s) left today (UTC)"
+        )
 
     if args.report is not None:
         # The question asked after every run. Reading it from the per-day log
@@ -504,7 +550,7 @@ async def run(args: argparse.Namespace) -> int:
             batch_size=args.batch,
             per_minute=args.rpm,
             checkpoint=checkpoint,
-            daily_budget=args.daily_limit,
+            daily_budget=999999 if args.ignore_daily_budget else args.daily_limit,
         )
     except DailyQuotaReached as exc:
         stopped_early = True
@@ -534,7 +580,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--match", default=None, help="only courses whose title contains this"
     )
     parser.add_argument("--level", default=None, help="Bachelors | Masters | PhD")
-    parser.add_argument("--country", default=None)
+    parser.add_argument("--country", default=None, help="single country or comma-separated countries")
+    parser.add_argument(
+        "--region",
+        default=None,
+        help="europe | eu | canada | australia (covers 13 European nations)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="maximum number of courses to process in this run",
+    )
+    parser.add_argument(
+        "--ignore-daily-budget",
+        action="store_true",
+        help="bypass local daily spend ledger and let API rate limits govern",
+    )
     parser.add_argument(
         "--checkpoint",
         default=str(REPO_ROOT / "data" / "embedding_checkpoint.json"),

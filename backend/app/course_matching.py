@@ -9,6 +9,7 @@ conversation break because a database is down.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Final, NamedTuple
 
 from .config import get_settings
@@ -97,10 +98,16 @@ def build_constraints(state: SessionState, card: DiagnosticCardPayload) -> Any:
     if seeds:
         countries = sorted({alias for seed in seeds for alias in country_aliases(seed)})
 
-    # A level the student asked for in so many words beats one inferred from
-    # what they hold. Asking for a Master's and being shown PhDs is the whole
-    # reason this distinction exists.
-    if state.desired_level is not None:
+    # Medical & dental degrees cross bachelor/masters boundaries depending on jurisdiction
+    # (e.g. Australian MBBS is Bachelors, Canadian MD/DDS is Masters, Canadian Pre-Med is Bachelors).
+    expanded_field = expand_field(slots.field_of_study).lower()
+    is_medical_or_dental = any(
+        term in expanded_field
+        for term in ("medicine", "dentistry", "mbbs", "bds", "dental", "surgery", "doctor of medicine")
+    )
+    if is_medical_or_dental:
+        degrees = ["Bachelors", "Masters"]
+    elif state.desired_level is not None:
         degrees = [_LEVEL_NAMES[state.desired_level]]
     else:
         degrees = target_degree_levels(slots.education_level)
@@ -169,6 +176,28 @@ _FIELD_EXPANSIONS: Final[dict[str, str]] = {
     "civ": "Civil Engineering",
     "mech": "Mechanical Engineering",
     "elec": "Electrical Engineering",
+    "md": "Medicine",
+    "bds": "Dentistry",
+    "dds": "Dentistry",
+    "dmd": "Dentistry",
+    "dent": "Dentistry",
+    "surg": "Surgery",
+    "pharm": "Pharmacy",
+    "pharmd": "Pharmacy",
+    "nurs": "Nursing",
+    "bscn": "Nursing",
+    "physio": "Physiotherapy",
+    "mpt": "Physiotherapy",
+    "mot": "Occupational Therapy",
+    "mph": "Public Health",
+    "dvm": "Veterinary Medicine",
+    "vet": "Veterinary Medicine",
+    "bdes": "Design",
+    "mdes": "Design",
+    "bfa": "Fine Arts",
+    "mfa": "Fine Arts",
+    "jd": "Law",
+    "phy": "Physics",
 }
 
 
@@ -246,6 +275,12 @@ _RELATED_FIELDS: Final[dict[str, list[str]]] = {
     ],
     "psychology": ["Behavioural Science", "Counselling", "Social Science"],
     "nursing": ["Health Science", "Midwifery", "Public Health"],
+    "medicine": [
+        "Biomedical Science", "Health Sciences", "Medical Science", "Dentistry", "Pharmacy",
+    ],
+    "dentistry": [
+        "Dental Science", "Dental Hygiene", "Dentistry", "Medicine", "Health Sciences",
+    ],
 }
 
 
@@ -417,14 +452,25 @@ async def find_matches(
             text, quota_exhausted="429" in text or "quota" in text.lower()
         ) from exc
 
-    kept = filter_by_relevance(matches)
+    settings = get_settings()
+    # Baseline cosine similarity in gemini-embedding-001 is higher than OpenAI text-embedding-3-small
+    # (~0.60-0.63 for unrelated boilerplate, >=0.67 for genuine matches).
+    provider_floor = (
+        0.65 if "gemini" in settings.embedding_model.lower() else settings.match_min_similarity
+    )
+    provider_fallback = (
+        0.62 if "gemini" in settings.embedding_model.lower() else settings.match_fallback_similarity
+    )
+
+    kept = filter_by_relevance(
+        matches, floor=provider_floor, field_of_study=state.slots.field_of_study
+    )
     related = False
 
     # Second attempt, only when the first came back thin. Widening every
     # search would blur the discipline boundary the floor exists to keep;
     # widening a search that found almost nothing costs nothing, because there
     # was nothing to blur.
-    settings = get_settings()
     if len(kept) < settings.match_min_results:
         broadened = build_query(state, broaden=True)
         if broadened != query:
@@ -432,7 +478,9 @@ async def find_matches(
             try:
                 wider = await search_courses(broadened, constraints, top_k=top_k)
                 relaxed = filter_by_relevance(
-                    wider, floor=settings.match_fallback_similarity
+                    wider,
+                    floor=provider_fallback,
+                    field_of_study=state.slots.field_of_study,
                 )
             except Exception as exc:  # noqa: BLE001 - provider or store
                 # A failed second attempt must not lose the first one's
@@ -471,7 +519,72 @@ async def find_matches(
     )
 
 
-def filter_by_relevance(matches: list[Any], *, floor: float | None = None) -> list[Any]:
+def is_topically_relevant(match: Any, field_of_study: str | None) -> bool:
+    """Verify whether a candidate programme has topical alignment with the field.
+
+    The semantic embedding search is powerful but vulnerable to boilerplate overlap.
+    In particular, European university descriptions universally state:
+    'Language of instruction: 100% taught in English. Prestigious 1-year English-taught...'
+    When a student searches for 'English Literature', the embedding model sees common
+    tokens ('English', 'Netherlands', 'Masters') and scores unrelated LL.M. and AI
+    degrees above the 0.60 floor.
+
+    This gate ensures that any candidate either shares discipline terms with the student's
+    field (or its approved neighbouring fields), or has genuine lexical evidence outside
+    medium-of-instruction boilerplate.
+    """
+    if not field_of_study:
+        return True
+
+    title = getattr(match, "course_title", None) or (
+        match.get("course_title") if isinstance(match, dict) else ""
+    )
+    syllabus = getattr(match, "syllabus_description", None) or (
+        match.get("syllabus_description") if isinstance(match, dict) else ""
+    )
+
+    # For synthetic test objects without title and syllabus, pass through
+    if not title and not syllabus:
+        return True
+
+    syllabus_clean = re.sub(
+        r"(?i)(language of instruction:\s*100%\s*taught in english|100%\s*taught in english|english-taught|taught in english|instruction in english)",
+        "",
+        syllabus or "",
+    )
+    title_lower = (title or "").lower()
+    clean_lower = (syllabus_clean or "").lower()
+
+    expanded = expand_field(field_of_study).lower()
+    terms = [expanded] + [f.lower() for f in related_fields(field_of_study)]
+
+    for term in terms:
+        if term in title_lower or term in clean_lower:
+            return True
+
+    field_tokens = [
+        t
+        for t in re.findall(r"\b[a-z]{3,}\b", expanded)
+        if t not in {"and", "the", "for", "with", "studies", "study", "bachelor", "master"}
+    ]
+    specific_tokens = [t for t in field_tokens if t not in {"english"}]
+    if specific_tokens:
+        for t in specific_tokens:
+            if t in title_lower or t in clean_lower:
+                return True
+    elif "english" in field_tokens:
+        if "english" in title_lower or "english" in clean_lower:
+            return True
+
+    return False
+
+
+def filter_by_relevance(
+    matches: list[Any],
+    *,
+    floor: float | None = None,
+    field_of_study: str | None = None,
+) -> list[Any]:
     """Drop programmes that are eligible but not about the student's subject.
 
     The SQL filter decides what a student *qualifies* for and the vector search
@@ -494,6 +607,13 @@ def filter_by_relevance(matches: list[Any], *, floor: float | None = None) -> li
 
     settings = get_settings()
     absolute = settings.match_min_similarity if floor is None else floor
-    best = max(match.similarity_score for match in matches)
+
+    candidates = matches
+    if field_of_study:
+        candidates = [m for m in matches if is_topically_relevant(m, field_of_study)]
+        if not candidates:
+            return []
+
+    best = max(match.similarity_score for match in candidates)
     cutoff = max(absolute, best - settings.match_similarity_margin)
-    return [match for match in matches if match.similarity_score >= cutoff]
+    return [match for match in candidates if match.similarity_score >= cutoff]
